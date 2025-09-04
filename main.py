@@ -42,9 +42,9 @@ def send_telegram(message):
     except Exception as e:
         print(f"[Telegram Exception] {e}", flush=True)
 
-def get_data(ticker):
+def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
     try:
-        bars = client.get_bars(ticker, TimeFrame.Minute, limit=100).df
+        bars = client.get_bars(ticker, timeframe, limit=limit).df
         if bars.empty:
             return pd.DataFrame()
         bars['body'] = abs(bars['close'] - bars['open'])
@@ -116,9 +116,9 @@ def determine_qty(rating):
 
 def calculate_confidence_tp(df, side, entry_price):
     avg_range = df['range'][-20:].mean()
-    confidence_multiplier = 2 if side == "buy" else 2.5
+    confidence_multiplier = 2 if side == "long" else 2.5
     tp_buffer = avg_range * confidence_multiplier
-    if side == "buy":
+    if side == "long":
         return round(entry_price + tp_buffer, 2)
     else:
         return round(entry_price - tp_buffer, 2)
@@ -131,7 +131,7 @@ def check_positions():
                 if order.filled_avg_price:
                     current_price = client.get_latest_trade(ticker).price
                     gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'long' else (pos['entry'] - current_price) / pos['entry'] * 100
-                    if gain <= -1 or gain >= pos['tp']:  # SL = 1%, TP = dynamic %
+                    if gain <= -1 or gain >= pos['tp']:
                         close_side = "sell" if pos['side'] == "long" else "buy"
                         client.submit_order(
                             symbol=ticker,
@@ -147,23 +147,38 @@ def check_positions():
 
 def check_smc():
     if not is_market_open_now():
-        print("Market is closed.", flush=True)
+        return
+
+    total_trades = sum(len(p) for p in open_positions.values())
+    if total_trades >= 3:
         return
 
     for ticker in TICKERS:
         if ticker not in open_positions:
             open_positions[ticker] = []
 
-        if len(open_positions[ticker]) >= 1:
+        if open_positions[ticker]:
             continue
 
         df = get_data(ticker)
         if df.shape[0] < 100:
             continue
 
-        structure = detect_structure(df)
-        if not structure or not structure['bos']:
+        ltf_structure = detect_structure(df)
+        if not ltf_structure or not ltf_structure['bos']:
             continue
+
+        htf_h1 = get_data(ticker, timeframe=TimeFrame.Hour, limit=50)
+        htf_h4 = get_data(ticker, timeframe=TimeFrame(4, TimeFrame.Hour), limit=50)
+
+        h1_trend = detect_structure(htf_h1)
+        h4_trend = detect_structure(htf_h4)
+
+        if not h1_trend or not h4_trend:
+            continue
+
+        if ltf_structure['trend'] != h1_trend['trend'] or ltf_structure['trend'] != h4_trend['trend']:
+            continue  # HTF filter fails
 
         fvg = detect_fvg(df)
         ob = detect_order_block(df)
@@ -171,10 +186,10 @@ def check_smc():
             continue
 
         last_price = df.iloc[-1]['close']
-        if structure['trend'] == "bullish" and last_price < fvg['start'] and last_price >= ob['close']:
+        if ltf_structure['trend'] == "bullish" and last_price < fvg['start'] and last_price >= ob['close']:
             entry_signal = True
             side = "long"
-        elif structure['trend'] == "bearish" and last_price > fvg['start'] and last_price <= ob['close']:
+        elif ltf_structure['trend'] == "bearish" and last_price > fvg['start'] and last_price <= ob['close']:
             entry_signal = True
             side = "short"
         else:
@@ -212,8 +227,8 @@ def check_smc():
         except Exception as e:
             print(f"Order error on {ticker}: {e}", flush=True)
 
-schedule.every(1).minutes.do(check_smc)
-schedule.every(2).minutes.do(check_positions)
+schedule.every(20).seconds.do(check_smc)
+schedule.every(20).seconds.do(check_positions)
 
 try:
     send_telegram("✅ Multi-Asset SMC Bot started.")
