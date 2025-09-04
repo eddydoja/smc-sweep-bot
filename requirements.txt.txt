@@ -1,0 +1,5 @@
+alpaca-py
+pandas
+schedule
+requests
+python-dotenv
