@@ -1,4 +1,4 @@
-alpaca-py==0.42.1
+alpaca-trade-api
 pandas
 schedule
 requests
