@@ -3,3 +3,4 @@ pandas
 requests==2.31.0
 schedule
 python-dotenv
+twelvedata
