@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 from alpaca_trade_api.rest import REST, TimeFrame
-import random
 
 load_dotenv()
 
@@ -17,10 +16,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 TICKERS = [
-    "SPY", "QQQ", "DIA",  # SPX500, NASDAQ100, Dow
-    "DAX", "UKX",          # DAX, FTSE100 (proxy ETF/CFDs)
+    "SPY", "QQQ", "DIA",
+    "DAX", "UKX",
     "EURUSD", "GBPUSD", "USDJPY",
-    "AUDUSD", "USDCAD"     # Major FX pairs
+    "AUDUSD", "USDCAD"
 ]
 
 client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
@@ -45,7 +44,7 @@ def send_telegram(message):
 
 def get_data(ticker):
     try:
-        bars = client.get_bars(ticker, TimeFrame.Minute, limit=20).df
+        bars = client.get_bars(ticker, TimeFrame.Minute, limit=100).df
         if bars.empty:
             return pd.DataFrame()
         bars['body'] = abs(bars['close'] - bars['open'])
@@ -115,6 +114,15 @@ def detect_order_block(df):
 def determine_qty(rating):
     return min(10, max(1, rating))
 
+def calculate_confidence_tp(df, side, entry_price):
+    avg_range = df['range'][-20:].mean()
+    confidence_multiplier = 2 if side == "buy" else 2.5
+    tp_buffer = avg_range * confidence_multiplier
+    if side == "buy":
+        return round(entry_price + tp_buffer, 2)
+    else:
+        return round(entry_price - tp_buffer, 2)
+
 def check_positions():
     for ticker, positions in open_positions.items():
         for pos in positions[:]:
@@ -122,13 +130,13 @@ def check_positions():
                 order = client.get_order(pos['id'])
                 if order.filled_avg_price:
                     current_price = client.get_latest_trade(ticker).price
-                    gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'buy' else (pos['entry'] - current_price) / pos['entry'] * 100
-                    if gain <= -1 or gain >= pos['tp']:
-                        side = "sell" if pos['side'] == "buy" else "buy"
+                    gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'long' else (pos['entry'] - current_price) / pos['entry'] * 100
+                    if gain <= -1 or gain >= pos['tp']:  # SL = 1%, TP = dynamic %
+                        close_side = "sell" if pos['side'] == "long" else "buy"
                         client.submit_order(
                             symbol=ticker,
                             qty=pos['qty'],
-                            side=side,
+                            side=close_side,
                             type="market",
                             time_in_force="gtc"
                         )
@@ -150,7 +158,7 @@ def check_smc():
             continue
 
         df = get_data(ticker)
-        if df.shape[0] < 20:
+        if df.shape[0] < 100:
             continue
 
         structure = detect_structure(df)
@@ -165,10 +173,10 @@ def check_smc():
         last_price = df.iloc[-1]['close']
         if structure['trend'] == "bullish" and last_price < fvg['start'] and last_price >= ob['close']:
             entry_signal = True
-            side = "buy"
+            side = "long"
         elif structure['trend'] == "bearish" and last_price > fvg['start'] and last_price <= ob['close']:
             entry_signal = True
-            side = "sell"
+            side = "short"
         else:
             entry_signal = False
 
@@ -176,16 +184,16 @@ def check_smc():
             continue
 
         entry_price = float(last_price)
-        sl = round(entry_price * 0.99, 2) if side == "buy" else round(entry_price * 1.01, 2)
-        tp_percent = random.uniform(0.01, 0.05)
-        tp = round(entry_price * (1 + tp_percent), 2) if side == "buy" else round(entry_price * (1 - tp_percent), 2)
+        sl = round(entry_price * 0.99, 2) if side == "long" else round(entry_price * 1.01, 2)
+        tp = calculate_confidence_tp(df, side, entry_price)
+        tp_pct = abs((tp - entry_price) / entry_price * 100)
         qty = determine_qty(rating=7)
 
         try:
             order = client.submit_order(
                 symbol=ticker,
                 qty=qty,
-                side=side,
+                side="buy" if side == "long" else "sell",
                 type="market",
                 time_in_force="gtc",
                 order_class="bracket",
@@ -196,11 +204,11 @@ def check_smc():
                 'id': order.id,
                 'side': side,
                 'entry': entry_price,
-                'tp': tp_percent * 100,
+                'tp': tp_pct,
                 'qty': qty,
                 'timestamp': datetime.now(pytz.timezone("US/Eastern"))
             })
-            send_telegram(f"📥 {ticker} SIGNAL: {side.upper()} {qty} @ {entry_price}\nTP: {tp} ({tp_percent*100:.1f}%) | SL: {sl} (1%)")
+            send_telegram(f"📥 {ticker} SIGNAL: {side.upper()} {qty} @ {entry_price}\nTP: {tp} ({tp_pct:.1f}%) | SL: {sl} (1%)")
         except Exception as e:
             print(f"Order error on {ticker}: {e}", flush=True)
 
