@@ -44,11 +44,24 @@ def send_telegram(message):
 
 def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
     try:
-        bars = client.get_bars(ticker, timeframe, limit=limit).df
+        bars = client.get_bars(ticker, timeframe, limit=min(limit, 50)).df
         if bars.empty:
             return pd.DataFrame()
         bars['body'] = abs(bars['close'] - bars['open'])
         bars['range'] = bars['high'] - bars['low']
+        bars['upper_wick'] = bars['high'] - bars[['open', 'close']].max(axis=1)
+        bars['lower_wick'] = bars[['open', 'close']].min(axis=1) - bars['low']
+        bars['is_doji'] = (bars['body'] / bars['range']) < 0.1
+        bars['bullish_engulfing'] = (bars['close'].shift(1) < bars['open'].shift(1)) & (bars['close'] > bars['open']) & (bars['close'] > bars['open'].shift(1)) & (bars['open'] < bars['close'].shift(1))
+        bars['bearish_engulfing'] = (bars['close'].shift(1) > bars['open'].shift(1)) & (bars['close'] < bars['open']) & (bars['close'] < bars['open'].shift(1)) & (bars['open'] > bars['close'].shift(1))
+        bars['hammer'] = (bars['body'] / bars['range'] < 0.3) & (bars['lower_wick'] > bars['body'])
+        bars['inverted_hammer'] = (bars['body'] / bars['range'] < 0.3) & (bars['upper_wick'] > bars['body'])
+        bars['wick_rejection_up'] = bars['upper_wick'] > (bars['range'] * 0.6)
+        bars['wick_rejection_down'] = bars['lower_wick'] > (bars['range'] * 0.6)
+        bars['3bar_bullish'] = (bars['close'].shift(2) < bars['open'].shift(2)) & (bars['is_doji'].shift(1)) & (bars['close'] > bars['open'])
+        bars['3bar_bearish'] = (bars['close'].shift(2) > bars['open'].shift(2)) & (bars['is_doji'].shift(1)) & (bars['close'] < bars['open'])
+        bars['liquidity_sweep_high'] = bars['high'] > bars['high'].rolling(window=20).max().shift(1)
+        bars['liquidity_sweep_low'] = bars['low'] < bars['low'].rolling(window=20).min().shift(1)
         return bars
     except Exception as e:
         print(f"Error fetching data for {ticker}: {e}", flush=True)
@@ -111,17 +124,30 @@ def detect_order_block(df):
             }
     return None
 
-def determine_qty(rating):
-    return min(10, max(1, rating))
+def calculate_confidence(df, last_candle):
+    score = 0
+    if last_candle['bullish_engulfing'] or last_candle['bearish_engulfing']:
+        score += 2
+    if last_candle['hammer'] or last_candle['inverted_hammer']:
+        score += 1
+    if last_candle['3bar_bullish'] or last_candle['3bar_bearish']:
+        score += 2
+    if last_candle['is_doji']:
+        score += 1
+    if last_candle['wick_rejection_down'] or last_candle['wick_rejection_up']:
+        score += 1
+    if last_candle['liquidity_sweep_high'] or last_candle['liquidity_sweep_low']:
+        score += 2
+    return min(10, max(1, score))
+
+def determine_qty(confidence):
+    return min(10, max(1, confidence))
 
 def calculate_confidence_tp(df, side, entry_price):
     avg_range = df['range'][-20:].mean()
     confidence_multiplier = 2 if side == "long" else 2.5
     tp_buffer = avg_range * confidence_multiplier
-    if side == "long":
-        return round(entry_price + tp_buffer, 2)
-    else:
-        return round(entry_price - tp_buffer, 2)
+    return round(entry_price + tp_buffer, 2) if side == "long" else round(entry_price - tp_buffer, 2)
 
 def check_positions():
     for ticker, positions in open_positions.items():
@@ -169,8 +195,7 @@ def check_smc():
             continue
 
         htf_h1 = get_data(ticker, timeframe=TimeFrame.Hour, limit=50)
-        htf_h4 = get_data(ticker, timeframe=TimeFrame(4, TimeFrame.Hour), limit=50)
-
+        htf_h4 = get_data(ticker, timeframe=TimeFrame.Hour, limit=23)
         h1_trend = detect_structure(htf_h1)
         h4_trend = detect_structure(htf_h4)
 
@@ -178,7 +203,7 @@ def check_smc():
             continue
 
         if ltf_structure['trend'] != h1_trend['trend'] or ltf_structure['trend'] != h4_trend['trend']:
-            continue  # HTF filter fails
+            continue
 
         fvg = detect_fvg(df)
         ob = detect_order_block(df)
@@ -186,23 +211,43 @@ def check_smc():
             continue
 
         last_price = df.iloc[-1]['close']
+        last_candle = df.iloc[-1]
+
+        entry_signal = False
+        side = None
+
         if ltf_structure['trend'] == "bullish" and last_price < fvg['start'] and last_price >= ob['close']:
-            entry_signal = True
-            side = "long"
+            if any([
+                last_candle['bullish_engulfing'],
+                last_candle['hammer'],
+                last_candle['is_doji'],
+                last_candle['wick_rejection_down'],
+                last_candle['3bar_bullish'],
+                last_candle['liquidity_sweep_low']
+            ]):
+                entry_signal = True
+                side = "long"
         elif ltf_structure['trend'] == "bearish" and last_price > fvg['start'] and last_price <= ob['close']:
-            entry_signal = True
-            side = "short"
-        else:
-            entry_signal = False
+            if any([
+                last_candle['bearish_engulfing'],
+                last_candle['inverted_hammer'],
+                last_candle['is_doji'],
+                last_candle['wick_rejection_up'],
+                last_candle['3bar_bearish'],
+                last_candle['liquidity_sweep_high']
+            ]):
+                entry_signal = True
+                side = "short"
 
         if not entry_signal:
             continue
 
+        confidence = calculate_confidence(df, last_candle)
         entry_price = float(last_price)
         sl = round(entry_price * 0.99, 2) if side == "long" else round(entry_price * 1.01, 2)
         tp = calculate_confidence_tp(df, side, entry_price)
         tp_pct = abs((tp - entry_price) / entry_price * 100)
-        qty = determine_qty(rating=7)
+        qty = determine_qty(confidence)
 
         try:
             order = client.submit_order(
@@ -223,7 +268,7 @@ def check_smc():
                 'qty': qty,
                 'timestamp': datetime.now(pytz.timezone("US/Eastern"))
             })
-            send_telegram(f"📥 {ticker} SIGNAL: {side.upper()} {qty} @ {entry_price}\nTP: {tp} ({tp_pct:.1f}%) | SL: {sl} (1%)")
+            send_telegram(f"📥 {ticker} SIGNAL: {side.upper()} {qty} @ {entry_price}\nTP: {tp} ({tp_pct:.1f}%) | SL: {sl} (1%) | Confidence: {confidence}/10")
         except Exception as e:
             print(f"Order error on {ticker}: {e}", flush=True)
 
