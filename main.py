@@ -14,7 +14,7 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 # Toggle to execute trades vs. alert-only
 TRADE_EXECUTION = True
 HEARTBEAT_TELEGRAM = False  # keep heartbeats only on Render logs
@@ -41,6 +41,21 @@ SESSION_FILTER = {
     'US': (13, 20)  # NY 9am–4pm EST (13–20 UTC approx)
 }
 
+from twelvedata import TDClient
+twelve = TDClient(apikey=os.getenv("TWELVE_DATA_API_KEY"))
+
+def get_fx_close(ticker):
+    """Fetch the most recent 1m close via Twelve Data."""
+    try:
+        symbol = ticker.replace("USD", "/USD") if "/" not in ticker else ticker
+        ts = twelve.time_series(symbol=symbol, interval="1min", outputsize=5)
+        df = ts.as_pandas()
+        if df.empty or len(df) < 5:
+            return None
+        return float(df['close'][-1]), float(df['close'][0])
+    except Exception as e:
+        print(f"{ticker} FX fetch error: {e}", flush=True)
+        return None
 
 def is_market_open_now():
     eastern = pytz.timezone("US/Eastern")
@@ -275,32 +290,31 @@ def check_smc():
 # Heartbeat for Render logs (and optional Telegram)
 def print_recent_price_action(ticker):
     try:
-        bars = client.get_bars(resolve_ticker(ticker), TimeFrame.Minute, limit=5).df
-        if bars.empty or len(bars) < 5:
-            print(f"{ticker}: Insufficient data", flush=True)
-            return
-
-        bars = bars.tail(5)
-        price_5m_ago = bars.iloc[0]['close']
-        latest_close = bars.iloc[-1]['close']
-        delta = latest_close - price_5m_ago
-        pct_change = (delta / price_5m_ago) * 100
-
-        if delta > 0:
-            arrow = "↑"
-        elif delta < 0:
-            arrow = "↓"
+        if ticker in ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]:
+            res = get_fx_close(ticker)
+            if res is None:
+                print(f"{ticker}: Insufficient data", flush=True); return
+            latest_close, close_5m_ago = res
         else:
-            arrow = "→"
+            bars = client.get_bars(resolve_ticker(ticker), TimeFrame.Minute, limit=5).df
+            if bars.empty or len(bars) < 5:
+                print(f"{ticker}: Insufficient data", flush=True); return
+            bars = bars.tail(5)
+            close_5m_ago = bars.iloc[0]['close']
+            latest_close = bars.iloc[-1]['close']
 
-        price_fmt = f"{latest_close:.4f}" if latest_close < 10 else f"{latest_close:.2f}"
-        delta_fmt = f"{delta:+.4f}" if abs(delta) < 1 else f"{delta:+.2f}"
+        delta = latest_close - close_5m_ago
+        pct_change = (delta / close_5m_ago) * 100
+
+        arrow = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+        price_fmt = (f"{latest_close:.4f}" if latest_close < 10 else f"{latest_close:.2f}")
+        delta_fmt = (f"{delta:+.4f}" if abs(delta) < 1 else f"{delta:+.2f}")
         pct_fmt = f"{pct_change:+.2f}%"
 
         print(f"{ticker}: {price_fmt} {arrow} ({delta_fmt} / {pct_fmt} over 5m)", flush=True)
 
     except Exception as e:
-        print(f"{ticker} price fetch error: {e}", flush=True)
+        print(f"{ticker} price action error: {e}", flush=True)
 
 def heartbeat():
     total = sum(len(v) for v in open_positions.values())
@@ -345,6 +359,7 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
 
 
 
