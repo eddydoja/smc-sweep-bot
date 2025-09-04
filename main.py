@@ -15,6 +15,10 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
+# Toggle to execute trades vs. alert-only
+TRADE_EXECUTION = True
+HEARTBEAT_TELEGRAM = False  # set True if you want a periodic heartbeat ping
+
 TICKERS = [
     "SPY", "QQQ", "DIA",
     "DAX", "UKX",
@@ -62,11 +66,11 @@ def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
         bars = client.get_bars(ticker, timeframe, limit=min(limit, 50)).df
         if bars.empty or len(bars) < 30:
             raise ValueError("Insufficient data")
-        bars['body'] = abs(bars['close'] - bars['open'])
+        bars['body'] = (bars['close'] - bars['open']).abs()
         bars['range'] = bars['high'] - bars['low']
-        bars['upper_wick'] = bars['high'] - bars[['open', 'close']].max(axis=1)
-        bars['lower_wick'] = bars[['open', 'close']].min(axis=1) - bars['low']
-        bars['is_doji'] = (bars['body'] / bars['range']) < 0.1
+        bars['upper_wick'] = bars['high'] - bars[["open", "close"]].max(axis=1)
+        bars['lower_wick'] = bars[["open", "close"]].min(axis=1) - bars['low']
+        bars['is_doji'] = (bars['body'] / bars['range']).fillna(0) < 0.1
         bars['bullish_engulfing'] = (bars['close'].shift(1) < bars['open'].shift(1)) & (bars['close'] > bars['open']) & (bars['close'] > bars['open'].shift(1)) & (bars['open'] < bars['close'].shift(1))
         bars['bearish_engulfing'] = (bars['close'].shift(1) > bars['open'].shift(1)) & (bars['close'] < bars['open']) & (bars['close'] < bars['open'].shift(1)) & (bars['open'] > bars['close'].shift(1))
         bars['hammer'] = (bars['body'] / bars['range'] < 0.3) & (bars['lower_wick'] > bars['body'])
@@ -77,10 +81,96 @@ def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
         bars['3bar_bearish'] = (bars['close'].shift(2) > bars['open'].shift(2)) & (bars['is_doji'].shift(1)) & (bars['close'] < bars['open'])
         bars['liquidity_sweep_high'] = bars['high'] > bars['high'].rolling(window=20).max().shift(1)
         bars['liquidity_sweep_low'] = bars['low'] < bars['low'].rolling(window=20).min().shift(1)
+        # Momentum candles (broader trigger): large body, displacement through prior H/L
+        atr = bars['range'].rolling(14).mean()
+        bars['bull_momo'] = (bars['close'] > bars['open']) & (bars['body'] > atr * 0.8) & (bars['close'] > bars['high'].shift(1))
+        bars['bear_momo'] = (bars['close'] < bars['open']) & (bars['body'] > atr * 0.8) & (bars['close'] < bars['low'].shift(1))
         return bars
     except Exception as e:
         send_telegram(f"⚠️ Data fetch failed for {ticker}: {e}")
         return pd.DataFrame()
+
+def detect_structure(df):
+    df = df.copy()
+    df['is_hh'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(-1))
+    df['is_ll'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(-1))
+    swing_highs = df[df['is_hh']]
+    swing_lows = df[df['is_ll']]
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return None
+    latest_highs = swing_highs.iloc[-2:]
+    latest_lows = swing_lows.iloc[-2:]
+
+    trend = "neutral"
+    bos = False
+    if latest_highs.iloc[1]['high'] > latest_highs.iloc[0]['high'] and latest_lows.iloc[1]['low'] > latest_lows.iloc[0]['low']:
+        trend = "bullish"; bos = True
+    elif latest_highs.iloc[1]['high'] < latest_highs.iloc[0]['high'] and latest_lows.iloc[1]['low'] < latest_lows.iloc[0]['low']:
+        trend = "bearish"; bos = True
+
+    return {"trend": trend, "swing_highs": swing_highs, "swing_lows": swing_lows, "bos": bos}
+
+def detect_fvg(df):
+    for i in range(2, len(df)):
+        if df.iloc[i-2]['low'] > df.iloc[i]['high']:
+            return {'start': df.iloc[i-2]['low'], 'end': df.iloc[i]['high'], 'index': i}
+        if df.iloc[i]['low'] > df.iloc[i-2]['high']:
+            return {'start': df.iloc[i]['low'], 'end': df.iloc[i-2]['high'], 'index': i}
+    return None
+
+def detect_order_block(df):
+    for i in range(len(df)-3, 0, -1):
+        # simple OB heuristic
+        if df.iloc[i]['close'] < df.iloc[i]['open'] and df.iloc[i+1]['close'] > df.iloc[i+1]['open']:
+            return {'open': df.iloc[i]['open'], 'close': df.iloc[i]['close']}
+        if df.iloc[i]['close'] > df.iloc[i]['open'] and df.iloc[i+1]['close'] < df.iloc[i+1]['open']:
+            return {'open': df.iloc[i]['open'], 'close': df.iloc[i]['close']}
+    return None
+
+def calculate_confidence(df, last_candle):
+    score = 0
+    if last_candle.get('bullish_engulfing', False) or last_candle.get('bearish_engulfing', False):
+        score += 2
+    if last_candle.get('hammer', False) or last_candle.get('inverted_hammer', False):
+        score += 1
+    if last_candle.get('3bar_bullish', False) or last_candle.get('3bar_bearish', False):
+        score += 2
+    if last_candle.get('is_doji', False):
+        score += 1
+    if last_candle.get('wick_rejection_down', False) or last_candle.get('wick_rejection_up', False):
+        score += 1
+    if last_candle.get('liquidity_sweep_high', False) or last_candle.get('liquidity_sweep_low', False):
+        score += 3  # heavier weight
+    if last_candle.get('bull_momo', False) or last_candle.get('bear_momo', False):
+        score += 2
+    return int(min(10, max(1, score)))
+
+def determine_qty(confidence):
+    return min(10, max(1, confidence))
+
+def calculate_confidence_tp(df, side, entry_price):
+    avg_range = df['range'][-20:].mean()
+    # more conservative when momentum candle not present
+    base_mult = 1.6
+    mult = base_mult + 0.6  # default 2.2R-ish of avg range
+    return round(entry_price + avg_range * mult, 2) if side == 'long' else round(entry_price - avg_range * mult, 2)
+
+def check_positions():
+    for ticker, positions in open_positions.items():
+        for pos in positions[:]:
+            try:
+                order = client.get_order(pos['id'])
+                if order.filled_avg_price:
+                    current_price = client.get_latest_trade(ticker).price
+                    gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'long' else (pos['entry'] - current_price) / pos['entry'] * 100
+                    if gain <= -1 or gain >= pos['tp']:
+                        close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                        if TRADE_EXECUTION:
+                            client.submit_order(symbol=ticker, qty=pos['qty'], side=close_side, type='market', time_in_force='gtc')
+                        send_telegram(f"📤 Exited {pos['side'].upper()} {pos['qty']} {ticker} at gain/loss: {gain:.2f}%")
+                        positions.remove(pos)
+            except Exception as e:
+                send_telegram(f"⚠️ Error checking {ticker} position: {e}")
 
 def check_smc():
     if not is_market_open_now():
@@ -101,39 +191,101 @@ def check_smc():
             continue
 
         last_signal = last_signal_time.get(ticker)
-        if last_signal and datetime.now(pytz.UTC) - last_signal < timedelta(minutes=1):
+        # shorter cooldown to increase frequency
+        if last_signal and datetime.now(pytz.UTC) - last_signal < timedelta(seconds=30):
             continue
 
-        # (Signal generation logic continues unchanged...)
+        df = get_data(ticker)
+        if df.shape[0] < 50:
+            continue
 
-        last_signal_time[ticker] = datetime.now(pytz.UTC)
+        ltf = detect_structure(df)
+        if not ltf or not ltf['bos'] or ltf['trend'] == 'neutral':
+            continue
 
-# (Other unchanged functions like detect_structure, etc., remain below)
+        # HTF alignment: relax to match EITHER H1 or H4
+        h1_df = get_data(ticker, timeframe=TimeFrame.Hour, limit=50)
+        h4_df = get_data(ticker, timeframe=TimeFrame.Hour, limit=23)  # proxy for H4 sample window
+        h1 = detect_structure(h1_df) if not h1_df.empty else None
+        h4 = detect_structure(h4_df) if not h4_df.empty else None
+        if not h1 or not h4:
+            continue
+        if (ltf['trend'] != h1['trend']) and (ltf['trend'] != h4['trend']):
+            continue
+
+        fvg = detect_fvg(df); ob = detect_order_block(df)
+        if not fvg or not ob:
+            continue
+
+        last = df.iloc[-1]
+        price = float(last['close'])
+        entry_signal = False; side = None
+
+        # Zone check
+        in_bull_zone = (ltf['trend'] == 'bullish') and (price < fvg['start']) and (price >= ob['close'])
+        in_bear_zone = (ltf['trend'] == 'bearish') and (price > fvg['start']) and (price <= ob['close'])
+
+        # Expanded triggers: include momentum candles
+        if in_bull_zone and any([last['bullish_engulfing'], last['hammer'], last['is_doji'], last['wick_rejection_down'], last['3bar_bullish'], last['liquidity_sweep_low'], last['bull_momo']]):
+            entry_signal = True; side = 'long'
+        if in_bear_zone and any([last['bearish_engulfing'], last['inverted_hammer'], last['is_doji'], last['wick_rejection_up'], last['3bar_bearish'], last['liquidity_sweep_high'], last['bear_momo']]):
+            entry_signal = True; side = 'short'
+
+        if not entry_signal:
+            continue
+
+        confidence = calculate_confidence(df, last)
+        entry = price
+        sl = round(entry * 0.99, 2) if side == 'long' else round(entry * 1.01, 2)
+        tp = calculate_confidence_tp(df, side, entry)
+        tp_pct = abs((tp - entry) / entry * 100)
+        qty = determine_qty(confidence)
+
+        try:
+            if TRADE_EXECUTION:
+                order = client.submit_order(
+                    symbol=ticker, qty=qty, side=('buy' if side == 'long' else 'sell'), type='market', time_in_force='gtc',
+                    order_class='bracket', stop_loss={"stop_price": str(sl)}, take_profit={"limit_price": str(tp)}
+                )
+                order_id = order.id
+            else:
+                order_id = f"signal-{datetime.now(pytz.UTC).isoformat()}"
+            open_positions[ticker].append({'id': order_id, 'side': side, 'entry': entry, 'tp': tp_pct, 'qty': qty, 'timestamp': datetime.now(pytz.UTC)})
+            last_signal_time[ticker] = datetime.now(pytz.UTC)
+            send_telegram(f"📥 {ticker} SIGNAL: {side.upper()} {qty} @ {entry}\nTP: {tp} ({tp_pct:.1f}%) | SL: {sl} (1%) | Confidence: {confidence}/10")
+        except Exception as e:
+            send_telegram(f"❌ Order error on {ticker}: {e}")
+
+# Heartbeat for Render logs (and optional Telegram)
+
+def heartbeat():
+    total = sum(len(v) for v in open_positions.values())
+    msg = f"⏱️ Heartbeat {datetime.now(pytz.UTC).strftime('%H:%M:%S')} UTC | open trades: {total} | tickers active: {len(TICKERS)}"
+    print(msg, flush=True)
+    if HEARTBEAT_TELEGRAM:
+        send_telegram(msg)
+
 
 def check_positions():
     for ticker, positions in open_positions.items():
         for pos in positions[:]:
             try:
-                order = client.get_order(pos['id'])
-                if order.filled_avg_price:
-                    current_price = client.get_latest_trade(ticker).price
-                    gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'long' else (pos['entry'] - current_price) / pos['entry'] * 100
-                    if gain <= -1 or gain >= pos['tp']:
-                        close_side = "sell" if pos['side'] == "long" else "buy"
-                        client.submit_order(
-                            symbol=ticker,
-                            qty=pos['qty'],
-                            side=close_side,
-                            type="market",
-                            time_in_force="gtc"
-                        )
-                        send_telegram(f"📤 Exited {pos['side'].upper()} {pos['qty']} {ticker} at gain/loss: {gain:.2f}%")
-                        positions.remove(pos)
+                order = client.get_order(pos['id']) if TRADE_EXECUTION else None
+                current_price = client.get_latest_trade(ticker).price
+                gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'long' else (pos['entry'] - current_price) / pos['entry'] * 100
+                if gain <= -1 or gain >= pos['tp']:
+                    close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                    if TRADE_EXECUTION:
+                        client.submit_order(symbol=ticker, qty=pos['qty'], side=close_side, type='market', time_in_force='gtc')
+                    send_telegram(f"📤 Exited {pos['side'].upper()} {pos['qty']} {ticker} at gain/loss: {gain:.2f}%")
+                    positions.remove(pos)
             except Exception as e:
                 send_telegram(f"⚠️ Error checking {ticker} position: {e}")
 
+# Scheduling
 schedule.every(30).seconds.do(check_smc)
 schedule.every(30).seconds.do(check_positions)
+schedule.every(60).seconds.do(heartbeat)
 
 try:
     send_telegram("✅ Multi-Asset SMC Bot started.")
