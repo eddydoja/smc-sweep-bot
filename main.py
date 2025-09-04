@@ -111,6 +111,27 @@ def check_smc():
 # (Other unchanged functions like detect_structure, etc., remain below)
 
 schedule.every(30).seconds.do(check_smc)
+def check_positions():
+    for ticker, positions in open_positions.items():
+        for pos in positions[:]:
+            try:
+                order = client.get_order(pos['id'])
+                if order.filled_avg_price:
+                    current_price = client.get_latest_trade(ticker).price
+                    gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'long' else (pos['entry'] - current_price) / pos['entry'] * 100
+                    if gain <= -1 or gain >= pos['tp']:
+                        close_side = "sell" if pos['side'] == "long" else "buy"
+                        client.submit_order(
+                            symbol=ticker,
+                            qty=pos['qty'],
+                            side=close_side,
+                            type="market",
+                            time_in_force="gtc"
+                        )
+                        send_telegram(f"📤 Exited {pos['side'].upper()} {pos['qty']} {ticker} at gain/loss: {gain:.2f}%")
+                        positions.remove(pos)
+            except Exception as e:
+                send_telegram(f"⚠️ Error checking {ticker} position: {e}")
 schedule.every(30).seconds.do(check_positions)
 
 try:
@@ -126,3 +147,4 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
