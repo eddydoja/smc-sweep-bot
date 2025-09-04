@@ -49,6 +49,20 @@ TWELVE_FX_SYMBOLS = {
     "USDCAD": "USD/CAD"
 }
 
+# --- NEW: Pacific session guard (6:00–16:00 America/Los_Angeles) ---
+PST_TZ = pytz.timezone("America/Los_Angeles")
+
+def in_pst_trading_window(now: datetime | None = None) -> bool:
+    """
+    True only from 06:00 to 16:00 America/Los_Angeles, inclusive of 06:00, exclusive of 16:00.
+    Applies every day; does not alter or remove any of your other session checks.
+    """
+    now = now.astimezone(PST_TZ) if now else datetime.now(PST_TZ)
+    start = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    end   = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return start <= now < end
+# --------------------------------------------------------------------
+
 # Utility functions
 
 def send_telegram(message):
@@ -167,6 +181,10 @@ def calculate_confidence_tp(df, side, entry_price):
 
 # SMC strategy
 def check_smc():
+    # --- NEW: limit signal searching to 6:00–16:00 PST ---
+    if not in_pst_trading_window():
+        return
+    # -----------------------------------------------------
     if not is_market_open_now():
         return
     total = sum(len(v) for v in open_positions.values())
@@ -223,6 +241,10 @@ def check_smc():
 
 # Scout strategy
 def scan_for_sweep_momentum_trades():
+    # --- NEW: limit scout signal searching to 6:00–16:00 PST ---
+    if not in_pst_trading_window():
+        return
+    # -----------------------------------------------------------
     if not SCOUT_TRADES_ENABLED:
         return
     total = sum(len(v) for v in open_positions.values())
@@ -318,6 +340,10 @@ def print_recent_price_action(ticker):
         print(f"{ticker} price action error: {e}", flush=True)
 
 def heartbeat():
+    # --- NEW: limit render/printing to 6:00–16:00 PST ---
+    if not in_pst_trading_window():
+        return
+    # ----------------------------------------------------
     total = sum(len(v) for v in open_positions.values())
     msg = f"⏱️ Heartbeat {datetime.now(pytz.UTC).strftime('%H:%M:%S')} UTC | open trades: {total} | tickers active: {len(TICKERS)}"
     print(msg, flush=True)
@@ -346,4 +372,3 @@ while True:
     except Exception as e:
         print(f"[Loop Error] {e}", flush=True)
         time.sleep(5)
-
