@@ -290,22 +290,30 @@ def print_recent_price_action(ticker):
     try:
         if ticker in TWELVE_FX_SYMBOLS:
             res = get_fx_close(ticker)
-            if not res:
-                print(f"{ticker}: Insufficient data", flush=True); return
-            latest, earlier = res
+            if res is None:
+                print(f"{ticker}: Insufficient data", flush=True)
+                return
+            latest_close, close_5m_ago = res
         else:
+            latest_trade = client.get_latest_trade(resolve_ticker(ticker))
+            latest_close = latest_trade.price
+
             bars = client.get_bars(resolve_ticker(ticker), TimeFrame.Minute, limit=5).df
             if bars.empty or len(bars) < 5:
-                print(f"{ticker}: Insufficient data", flush=True); return
-            bars = bars.tail(5)
-            earlier, latest = bars['close'].iloc[0], bars['close'].iloc[-1]
-        delta = latest - earlier
-        pct = (delta / earlier) * 100
+                print(f"{ticker}: Insufficient data", flush=True)
+                return
+            close_5m_ago = bars.iloc[0]['close']
+
+        delta = latest_close - close_5m_ago
+        pct_change = (delta / close_5m_ago) * 100
+
         arrow = "↑" if delta > 0 else "↓" if delta < 0 else "→"
-        pf = f"{latest:.4f}" if latest < 10 else f"{latest:.2f}"
-        dfmt = f"{delta:+.4f}" if abs(delta)<1 else f"{delta:+.2f}"
-        pfmt = f"{pct:+.2f}%"
-        print(f"{ticker}: {pf} {arrow} ({dfmt} / {pfmt} over 5m)", flush=True)
+        price_fmt = f"{latest_close:.4f}" if latest_close < 10 else f"{latest_close:.2f}"
+        delta_fmt = f"{delta:+.4f}" if abs(delta) < 1 else f"{delta:+.2f}"
+        pct_fmt = f"{pct_change:+.2f}%"
+
+        print(f"{ticker}: {price_fmt} {arrow} ({delta_fmt} / {pct_fmt} over 5m)", flush=True)
+
     except Exception as e:
         print(f"{ticker} price action error: {e}", flush=True)
 
@@ -326,7 +334,7 @@ schedule.every(60).seconds.do(heartbeat)
 
 # Launch
 try:
-    send_telegram("✅ Multi-Asset SMC Bot started.")
+    send_telegram("✅ Sniper Signal Bot started ✅")
     print("Bot is running...", flush=True)
 except Exception as e:
     print(f"[Startup Error] {e}", flush=True)
@@ -338,3 +346,4 @@ while True:
     except Exception as e:
         print(f"[Loop Error] {e}", flush=True)
         time.sleep(5)
+
