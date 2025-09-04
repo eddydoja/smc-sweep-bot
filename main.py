@@ -194,7 +194,7 @@ def check_smc():
         if not ltf_structure or not ltf_structure['bos']:
             continue
 
-        htf_h1 = get_data(ticker, timeframe=TimeFrame.Hour, limit=50)
+        htf_h1 = get_data(ticker, timeframe=TimeFrame.Hour, limit=23)
         htf_h4 = get_data(ticker, timeframe=TimeFrame.Hour, limit=23)
         h1_trend = detect_structure(htf_h1)
         h4_trend = detect_structure(htf_h4)
@@ -272,8 +272,8 @@ def check_smc():
         except Exception as e:
             print(f"Order error on {ticker}: {e}", flush=True)
 
-schedule.every(20).seconds.do(check_smc)
-schedule.every(20).seconds.do(check_positions)
+schedule.every(24).seconds.do(check_smc)
+schedule.every(24).seconds.do(check_positions)
 
 try:
     send_telegram("✅ Multi-Asset SMC Bot started.")
@@ -288,3 +288,4 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
