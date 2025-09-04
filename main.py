@@ -137,8 +137,9 @@ def scan_for_sweep_momentum_trades():
                 'timestamp': now
             })
             last_scout_signal_time[ticker] = now
-            send_telegram(f"⚡ SCOUT {ticker}: {side.upper()} {qty} @ {entry}
-TP: {tp} ({tp_pct:.1f}%) | SL: {sl} | Confidence: {confidence}/10")
+            send_telegram(
+                f"⚡ SCOUT {ticker}: {side.upper()} {qty} @ {entry}\nTP: {tp} ({tp_pct:.1f}%) | SL: {sl} | Confidence: {confidence}/10"
+            )
         except Exception as e:
             send_telegram(f"❌ Scout order error on {ticker}: {e}")
 
@@ -161,4 +162,3 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
-
