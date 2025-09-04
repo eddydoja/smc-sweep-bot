@@ -8,48 +8,61 @@ import pytz
 from dotenv import load_dotenv
 from alpaca_trade_api.rest import REST, TimeFrame
 
+# Load environment variables
 load_dotenv()
-
-# Load secrets from environment variables
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TICKER = "SPY"
 
+# Alpaca client
 client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
 
+# Only run during US stock market hours
 def is_market_open_now():
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
-    return now.weekday() < 5 and (now.hour == 9 and now.minute >= 30 or 10 <= now.hour < 16)
+    return now.weekday() < 5 and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16))
 
+# Get 3 most recent candles
 def get_data():
-    bars = client.get_bars(TICKER, TimeFrame.Minute, limit=3).df
-    if bars.empty or 'open' not in bars.columns or 'close' not in bars.columns:
-        return pd.DataFrame()  # Prevents errors
-    bars['body'] = abs(bars['close'] - bars['open'])
-    bars['range'] = bars['high'] - bars['low']
-    return bars
+    try:
+        bars = client.get_bars(TICKER, TimeFrame.Minute, limit=3).df
+        if bars.empty or 'open' not in bars.columns or 'close' not in bars.columns:
+            print("No valid data from Alpaca.")
+            return pd.DataFrame()
+        bars['body'] = abs(bars['close'] - bars['open'])
+        bars['range'] = bars['high'] - bars['low']
+        return bars
+    except Exception as e:
+        print(f"Data fetch error: {e}")
+        return pd.DataFrame()
 
+# Analyze for SMC pattern
 def check_smc():
     if not is_market_open_now():
+        print("Market is closed.")
         return
 
     df = get_data()
     if df.shape[0] < 3:
+        print("Not enough data to analyze.")
         return
 
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
 
-    bullish_engulfing = c2['close'] < c2['open'] and c3['close'] > c3['open'] and c3['close'] > c2['open'] and c3['open'] < c2['close']
-    bearish_engulfing = c2['close'] > c2['open'] and c3['close'] < c3['open'] and c3['close'] < c2['open'] and c3['open'] > c2['close']
+    bullish = c2['close'] < c2['open'] and c3['close'] > c3['open'] and c3['close'] > c2['open'] and c3['open'] < c2['close']
+    bearish = c2['close'] > c2['open'] and c3['close'] < c3['open'] and c3['close'] < c2['open'] and c3['open'] > c2['close']
 
-    if bullish_engulfing:
+    if bullish:
         send_telegram(f"📈 Bullish SMC Detected on {TICKER}")
-    elif bearish_engulfing:
+    elif bearish:
         send_telegram(f"📉 Bearish SMC Detected on {TICKER}")
+    else:
+        print("No signal detected.")
 
+# Telegram alert sender
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -57,18 +70,29 @@ def send_telegram(message):
         "text": message
     }
     try:
-        requests.post(url, json=payload)
+        response = requests.post(url, json=payload)
+        if response.ok:
+            print(f"Sent Telegram message: {message}")
+        else:
+            print(f"Telegram error: {response.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram exception: {e}")
 
 # Start scheduler
 schedule.every(1).minutes.do(check_smc)
 
-# Send startup message once
-send_telegram("✅ SMC Sweep Bot has started successfully.")
-print("Bot is running...")
+# Only send startup message once per deployment
+try:
+    send_telegram("✅ SMC Sweep Bot has started successfully.")
+    print("Bot is running...")
+except Exception as e:
+    print(f"Startup Telegram error: {e}")
 
+# Main loop with visible logs
 while True:
-    schedule.run_pending()
-    time.sleep(1)
-
+    try:
+        schedule.run_pending()
+        time.sleep(1)
+    except Exception as loop_error:
+        print(f"Loop error: {loop_error}")
+        time.sleep(5)
