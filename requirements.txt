@@ -1,5 +1,5 @@
 alpaca-trade-api
 pandas
-schedule
 requests
+schedule
 python-dotenv
