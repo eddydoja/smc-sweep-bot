@@ -100,7 +100,6 @@ print("Bot is running...")
 while True:
     schedule.run_pending()
     time.sleep(1)
-    except Exception as loop_error:
-        print(f"Loop error: {loop_error}")
         
+
 
