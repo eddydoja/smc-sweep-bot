@@ -8,24 +8,25 @@ import pytz
 from dotenv import load_dotenv
 from alpaca_trade_api.rest import REST, TimeFrame
 
-# Load environment variables
+# Load .env variables
 load_dotenv()
+
+# Load secrets from environment
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TICKER = "SPY"
 
-# Alpaca client
 client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
 
-# Only run during US stock market hours
+
 def is_market_open_now():
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
     return now.weekday() < 5 and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16))
 
-# Get 3 most recent candles
+
 def get_data():
     try:
         bars = client.get_bars(TICKER, TimeFrame.Minute, limit=3).df
@@ -36,10 +37,10 @@ def get_data():
         bars['range'] = bars['high'] - bars['low']
         return bars
     except Exception as e:
-        print(f"Data fetch error: {e}")
+        print(f"Data error: {e}")
         return pd.DataFrame()
 
-# Analyze for SMC pattern
+
 def check_smc():
     if not is_market_open_now():
         print("Market is closed.")
@@ -52,8 +53,18 @@ def check_smc():
 
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
 
-    bullish = c2['close'] < c2['open'] and c3['close'] > c3['open'] and c3['close'] > c2['open'] and c3['open'] < c2['close']
-    bearish = c2['close'] > c2['open'] and c3['close'] < c3['open'] and c3['close'] < c2['open'] and c3['open'] > c2['close']
+    bullish = (
+        c2['close'] < c2['open'] and
+        c3['close'] > c3['open'] and
+        c3['close'] > c2['open'] and
+        c3['open'] < c2['close']
+    )
+    bearish = (
+        c2['close'] > c2['open'] and
+        c3['close'] < c3['open'] and
+        c3['close'] < c2['open'] and
+        c3['open'] > c2['close']
+    )
 
     if bullish:
         send_telegram(f"📈 Bullish SMC Detected on {TICKER}")
@@ -62,7 +73,7 @@ def check_smc():
     else:
         print("No signal detected.")
 
-# Telegram alert sender
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -78,21 +89,22 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram exception: {e}")
 
-# Start scheduler
+
+# Schedule to run every minute
 schedule.every(1).minutes.do(check_smc)
 
-# Only send startup message once per deployment
+# 🟢 Send startup message ONCE and log
 try:
     send_telegram("✅ SMC Sweep Bot has started successfully.")
     print("Bot is running...")
 except Exception as e:
     print(f"Startup Telegram error: {e}")
 
-# Main loop with visible logs
+# 🔁 Main loop
 while True:
     try:
         schedule.run_pending()
         time.sleep(1)
     except Exception as loop_error:
         print(f"Loop error: {loop_error}")
-        time.sleep(5)
+        
