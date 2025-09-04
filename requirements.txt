@@ -1,0 +1,6 @@
+alpaca-trade-api
+# alpaca-py ← optional, but not needed for this script
+pandas
+schedule
+requests
+python-dotenv
