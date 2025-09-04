@@ -62,7 +62,7 @@ def send_telegram(message):
         print(f"Telegram error: {e}")
 
 # Start scheduler
-schedule.every(5).minutes.do(check_smc)
+schedule.every(1).minutes.do(check_smc)
 
 # Send startup message once
 send_telegram("✅ SMC Sweep Bot has started successfully.")
@@ -71,3 +71,4 @@ print("Bot is running...")
 while True:
     schedule.run_pending()
     time.sleep(1)
+
