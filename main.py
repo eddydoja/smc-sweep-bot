@@ -8,10 +8,10 @@ import datetime
 import requests
 
 # === CONFIG ===
-ALPACA_API_KEY = os.getenv'PKW2QGFBW74BYLLS48MS'
-ALPACA_SECRET_KEY = os.getenv'V8K9NaWTpYdL9NNuQRG54e2EvvdTsXPBzrmUCVMI'
-TELEGRAM_TOKEN = os.getenv'8405020655:AAHff_dafcrxkrLKLfQ1zjpYGKAudSM8H7w'
-TELEGRAM_CHAT_ID = os.getenv'5079232641'
+ALPACA_API_KEY = os.getenv('PKW2QGFBW74BYLLS48MS')
+ALPACA_SECRET_KEY = os.getenv('V8K9NaWTpYdL9NNuQRG54e2EvvdTsXPBzrmUCVMI')
+TELEGRAM_TOKEN = os.getenv('8405020655:AAHff_dafcrxkrLKLfQ1zjpYGKAudSM8H7w')
+TELEGRAM_CHAT_ID = os.getenv('5079232641')
 TICKER = 'SPY'
 SESSION_HOURS = {
     'asia': (0, 8),
@@ -115,3 +115,4 @@ print("Alpaca SMC Sweep Bot Running...")
 while True:
     schedule.run_pending()
     time.sleep(1)
+
