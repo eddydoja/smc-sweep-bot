@@ -8,10 +8,9 @@ import pytz
 from dotenv import load_dotenv
 from alpaca_trade_api.rest import REST, TimeFrame
 
-# Load .env variables
 load_dotenv()
 
-# Load secrets from environment
+# Load secrets
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -31,7 +30,6 @@ def get_data():
     try:
         bars = client.get_bars(TICKER, TimeFrame.Minute, limit=3).df
         if bars.empty or 'open' not in bars.columns or 'close' not in bars.columns:
-            print("No valid data from Alpaca.")
             return pd.DataFrame()
         bars['body'] = abs(bars['close'] - bars['open'])
         bars['range'] = bars['high'] - bars['low']
@@ -81,25 +79,20 @@ def send_telegram(message):
         "text": message
     }
     try:
-        response = requests.post(url, json=payload)
-        if response.ok:
-            print(f"Sent Telegram message: {message}")
-        else:
-            print(f"Telegram error: {response.text}")
+        requests.post(url, json=payload)
+        print(f"Sent Telegram message: {message}")
     except Exception as e:
-        print(f"Telegram exception: {e}")
+        print(f"Telegram error: {e}")
 
 
-# Schedule to run every minute
+# Scheduler
 schedule.every(1).minutes.do(check_smc)
 
-# Send startup message once
+# ✅ Send startup message ONCE
 send_telegram("✅ SMC Sweep Bot has started successfully.")
 print("Bot is running...")
 
+# Loop
 while True:
     schedule.run_pending()
     time.sleep(1)
-        
-
-
