@@ -1,5 +1,5 @@
 alpaca-trade-api
 pandas
-requests
+requests==2.31.0
 schedule
 python-dotenv
