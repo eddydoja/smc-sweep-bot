@@ -93,18 +93,14 @@ def send_telegram(message):
 # Schedule to run every minute
 schedule.every(1).minutes.do(check_smc)
 
-# 🟢 Send startup message ONCE and log
-try:
-    send_telegram("✅ SMC Sweep Bot has started successfully.")
-    print("Bot is running...")
-except Exception as e:
-    print(f"Startup Telegram error: {e}")
+# Send startup message once
+send_telegram("✅ SMC Sweep Bot has started successfully.")
+print("Bot is running...")
 
-# 🔁 Main loop
 while True:
-    try:
-        schedule.run_pending()
-        time.sleep(1)
+    schedule.run_pending()
+    time.sleep(1)
     except Exception as loop_error:
         print(f"Loop error: {loop_error}")
         
+
