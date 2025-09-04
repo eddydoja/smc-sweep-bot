@@ -1,121 +1,60 @@
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-import pandas as pd
-import schedule
+import os
 import time
-import datetime
 import requests
+import schedule
+import pandas as pd
+from dotenv import load_dotenv
+from alpaca_trade_api.rest import REST, TimeFrame
 
-# === CONFIG ===
-import os  # Make sure this line is included
+load_dotenv()
 
-ALPACA_API_KEY = os.getenv('PKW2QGFBW74BYLLS48MS')
-ALPACA_SECRET_KEY = os.getenv('V8K9NaWTpYdL9NNuQRG54e2EvvdTsXPBzrmUCVMI')
-TELEGRAM_TOKEN = os.getenv('8405020655:AAHff_dafcrxkrLKLfQ1zjpYGKAudSM8H7w')
-TELEGRAM_CHAT_ID = os.getenv('5079232641')
-TICKER = 'SPY'
-SESSION_HOURS = {
-    'asia': (0, 8),
-    'london': (3, 8),
-    'ny': (9, 12)
-}
+# Load secrets
+ALPACA_API_KEY = os.getenv("PKW2QGFBW74BYLLS48MS")
+ALPACA_SECRET_KEY = os.getenv("V8K9NaWTpYdL9NNuQRG54e2EvvdTsXPBzrmUCVMI")
+TELEGRAM_CHAT_ID = os.getenv(5079232641)
+TELEGRAM_TOKEN = os.getenv("8405020655:AAHff_dafcrxkrLKLfQ1zjpYGKAudSM8H7w")
+TICKER = "SPY"
 
-# === INIT ALPACA CLIENT ===
-client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
 
-# === TELEGRAM ALERT ===
-def send_telegram_message(message):
+def get_data():
+    bars = client.get_bars(TICKER, TimeFrame.Minute, limit=500).df
+    bars = bars.tail(3)  # Last 3 candles
+    bars['body'] = abs(bars['close'] - bars['open'])
+    bars['range'] = bars['high'] - bars['low']
+    return bars
+
+def check_smc():
+    df = get_data()
+
+    if df.shape[0] < 3:
+        return
+
+    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+
+    bullish_engulfing = c2['close'] < c2['open'] and c3['close'] > c3['open'] and c3['close'] > c2['open'] and c3['open'] < c2['close']
+    bearish_engulfing = c2['close'] > c2['open'] and c3['close'] < c3['open'] and c3['close'] < c2['open'] and c3['open'] > c2['close']
+
+    if bullish_engulfing:
+        send_telegram(f"Bullish SMC Detected on {TICKER}")
+    elif bearish_engulfing:
+        send_telegram(f"Bearish SMC Detected on {TICKER}")
+
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
-    requests.post(url, data=payload)
-
-# === FETCH CANDLES ===
-def get_candles(symbol=TICKER, tf_minutes=1, limit=500):
-    end_time = datetime.datetime.utcnow()
-    start_time = end_time - datetime.timedelta(minutes=limit)
-    request_params = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Minute,
-        start=start_time,
-        end=end_time
-    )
-    bars = client.get_stock_bars(request_params).df
-    df = bars[bars.index.get_level_values(0) == symbol].copy().reset_index()
-    df.rename(columns={'timestamp': 'Datetime'}, inplace=True)
-    df['hour'] = df['Datetime'].dt.hour
-    return df
-
-# === SMC LOGIC ===
-def detect_bias(df):
-    recent_highs = df['high'][-60:].max()
-    recent_lows = df['low'][-60:].min()
-    current = df['close'].iloc[-1]
-    if current > recent_highs:
-        return 'bullish'
-    elif current < recent_lows:
-        return 'bearish'
-    return 'neutral'
-
-def get_session_ranges(df):
-    asia = df[df['hour'].between(*SESSION_HOURS['asia'])]
-    london = df[df['hour'].between(*SESSION_HOURS['london'])]
-    ny = df[df['hour'].between(*SESSION_HOURS['ny'])]
-    return {
-        'asia_high': asia['high'].max(),
-        'asia_low': asia['low'].min(),
-        'london_high': london['high'].max(),
-        'london_low': london['low'].min(),
-        'ny_high': ny['high'].max(),
-        'ny_low': ny['low'].min()
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
     }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
-def detect_asia_sweep(price, asia_high, asia_low):
-    if price > asia_high:
-        return 'buy-side sweep of Asia'
-    elif price < asia_low:
-        return 'sell-side sweep of Asia'
-    return None
+schedule.every(5).minutes.do(check_smc)
 
-def detect_bos(df):
-    recent_high = df['high'].iloc[-5]
-    current_high = df['high'].iloc[-1]
-    return current_high > recent_high
+print("Bot is running...")
 
-def generate_signal(df):
-    bias = detect_bias(df)
-    session = get_session_ranges(df)
-    price = df['close'].iloc[-1]
-    sweep = detect_asia_sweep(price, session['asia_high'], session['asia_low'])
-    bos = detect_bos(df)
-
-    if bias == 'bullish' and sweep == 'sell-side sweep of Asia' and bos:
-        entry = price
-        sl = session['asia_low']
-        tp = entry + (entry - sl) * 1.5
-        return f"\U0001F7E2 LONG | Asia Sweep | Entry: {entry:.2f} | SL: {sl:.2f} | TP1: {tp:.2f}"
-
-    if bias == 'bearish' and sweep == 'buy-side sweep of Asia' and bos:
-        entry = price
-        sl = session['asia_high']
-        tp = entry - (sl - entry) * 1.5
-        return f"\U0001F534 SHORT | Asia Sweep | Entry: {entry:.2f} | SL: {sl:.2f} | TP1: {tp:.2f}"
-
-    return None
-
-# === RUN BOT ===
-def run_bot():
-    df = get_candles()
-    signal = generate_signal(df)
-    if signal:
-        print(signal)
-        send_telegram_message(signal)
-
-schedule.every(1).minutes.do(run_bot)
-
-print("Alpaca SMC Sweep Bot Running...")
 while True:
     schedule.run_pending()
     time.sleep(1)
-
-
