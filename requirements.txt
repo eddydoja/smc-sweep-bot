@@ -1,5 +1,4 @@
-alpaca-trade-api
-# alpaca-py ← optional, but not needed for this script
+alpaca-py
 pandas
 schedule
 requests
