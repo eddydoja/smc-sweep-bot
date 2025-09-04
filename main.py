@@ -146,7 +146,34 @@ def scan_for_sweep_momentum_trades():
         except Exception as e:
             send_telegram(f"❌ Scout order error on {ticker}: {e}")
 
-# Scheduling (final section)
+def check_positions():
+    for ticker, positions in open_positions.items():
+        for pos in positions[:]:
+            try:
+                order = client.get_order(pos['id']) if TRADE_EXECUTION else None
+                current_price = client.get_latest_trade(ticker).price
+                gain = (
+                    (current_price - pos['entry']) / pos['entry'] * 100
+                    if pos['side'] == 'long'
+                    else (pos['entry'] - current_price) / pos['entry'] * 100
+                )
+                if gain <= -1 or gain >= pos['tp']:
+                    close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                    if TRADE_EXECUTION:
+                        client.submit_order(
+                            symbol=ticker,
+                            qty=pos['qty'],
+                            side=close_side,
+                            type='market',
+                            time_in_force='gtc'
+                        )
+                    send_telegram(
+                        f"📤 Exited {pos['side'].upper()} {pos['qty']} {ticker} at gain/loss: {gain:.2f}%"
+                    )
+                    positions.remove(pos)
+            except Exception as e:
+                send_telegram(f"⚠️ Error checking {ticker} position: {e}")
+
 schedule.every(30).seconds.do(check_smc)
 schedule.every(30).seconds.do(check_positions)
 schedule.every(30).seconds.do(scan_for_sweep_momentum_trades)
@@ -165,3 +192,4 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
