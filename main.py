@@ -47,12 +47,16 @@ twelve = TDClient(apikey=os.getenv("TWELVE_DATA_API_KEY"))
 def get_fx_close(ticker):
     """Fetch the most recent 1m close via Twelve Data."""
     try:
-        symbol = ticker.replace("USD", "/USD") if "/" not in ticker else ticker
+        symbol = TWELVE_FX_SYMBOLS.get(ticker)
+        if not symbol:
+            print(f"{ticker} FX symbol not mapped")
+            return None
+
         ts = twelve.time_series(symbol=symbol, interval="1min", outputsize=5)
         df = ts.as_pandas()
         if df.empty or len(df) < 5:
             return None
-        return float(df['close'][-1]), float(df['close'][0])
+        return float(df['close'].iloc[-1]), float(df['close'].iloc[0])
     except Exception as e:
         print(f"{ticker} FX fetch error: {e}", flush=True)
         return None
@@ -359,6 +363,7 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
 
 
 
