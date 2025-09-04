@@ -44,6 +44,14 @@ SESSION_FILTER = {
 from twelvedata import TDClient
 twelve = TDClient(apikey=os.getenv("TWELVE_DATA_API_KEY"))
 
+TWELVE_FX_SYMBOLS = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD"
+}
+
 def get_fx_close(ticker):
     """Fetch the most recent 1m close via Twelve Data."""
     try:
@@ -363,6 +371,7 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
 
 
 
