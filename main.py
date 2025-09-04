@@ -38,7 +38,7 @@ def is_market_open_now():
     return now.weekday() < 5 and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16))
 
 def is_session_active(ticker):
-    now_hour = datetime.utcnow().hour
+    now_hour = datetime.now(pytz.UTC).hour
     if ticker in ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]:
         start, end = SESSION_FILTER['FX']
     else:
@@ -101,16 +101,15 @@ def check_smc():
             continue
 
         last_signal = last_signal_time.get(ticker)
-        if last_signal and datetime.utcnow() - last_signal < timedelta(minutes=1):
+        if last_signal and datetime.now(pytz.UTC) - last_signal < timedelta(minutes=1):
             continue
 
         # (Signal generation logic continues unchanged...)
 
-        last_signal_time[ticker] = datetime.utcnow()
+        last_signal_time[ticker] = datetime.now(pytz.UTC)
 
 # (Other unchanged functions like detect_structure, etc., remain below)
 
-schedule.every(30).seconds.do(check_smc)
 def check_positions():
     for ticker, positions in open_positions.items():
         for pos in positions[:]:
@@ -132,6 +131,8 @@ def check_positions():
                         positions.remove(pos)
             except Exception as e:
                 send_telegram(f"⚠️ Error checking {ticker} position: {e}")
+
+schedule.every(30).seconds.do(check_smc)
 schedule.every(30).seconds.do(check_positions)
 
 try:
@@ -147,4 +148,3 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
-
