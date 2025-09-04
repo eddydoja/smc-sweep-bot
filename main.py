@@ -49,23 +49,28 @@ def biased_tp(entry, direction):
     r = random.random() ** 0.5
     return round(entry * (low + (high - low) * r), 2)
 
+def trade_qty():
+    # Simulated rating system for determining quantity: 1 to 10 shares
+    return random.randint(1, 10)
+
 def place_trade(direction, entry):
     if len(open_trades) >= MAX_TRADES:
         print("Max trades reached, skipping.")
         return
 
-    sl = round(entry * (1 - STOP_LOSS_PCT), 2) if direction == "buy" else round(entry * (1 + STOP_LOSS_PCT),2)
+    qty = trade_qty()
+    sl = round(entry * (1 - STOP_LOSS_PCT), 2) if direction == "buy" else round(entry * (1 + STOP_LOSS_PCT), 2)
     tp = biased_tp(entry, direction)
 
     order = client.submit_order(
-        symbol=TICKER, qty=1, side=OrderSide.BUY if direction == "buy" else OrderSide.SELL,
+        symbol=TICKER, qty=qty, side=OrderSide.BUY if direction == "buy" else OrderSide.SELL,
         type="market", time_in_force=TimeInForce.GTC
     )
     open_trades[order.id] = {
         "entry": entry, "side": direction, "sl": sl, "tp": tp,
-        "peak": entry, "time": datetime.now(pytz.timezone("US/Eastern"))
+        "peak": entry, "time": datetime.now(pytz.timezone("US/Eastern")), "qty": qty
     }
-    send_telegram(f"{direction.upper()} @ {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
+    send_telegram(f"{direction.upper()} {qty}x @ {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
 
 def manage_exits():
     if not open_trades: return
@@ -76,13 +81,13 @@ def manage_exits():
         t["peak"] = max(t["peak"], price) if t["side"] == "buy" else min(t["peak"], price)
         drop_amount = t["peak"] * TRAIL_DROP
         if (t["side"] == "buy" and price <= t["peak"] - drop_amount) or (t["side"] == "sell" and price >= t["peak"] + drop_amount):
-            client.submit_order(symbol=TICKER, qty=1,
+            client.submit_order(symbol=TICKER, qty=t["qty"],
                                 side=OrderSide.SELL if t["side"] == "buy" else OrderSide.BUY,
                                 type="market", time_in_force=TimeInForce.GTC)
             pnl = (price - t["entry"]) if t["side"] == "buy" else (t["entry"] - price)
             pct = pnl / t["entry"] * 100
             dur = datetime.now(pytz.timezone("US/Eastern")) - t["time"]
-            send_telegram(f"EXIT {t['side'].upper()} @ {price:.2f} | P/L: {pct:.2f}% | Duration: {str(dur).split('.')[0]}")
+            send_telegram(f"EXIT {t['side'].upper()} {t['qty']}x @ {price:.2f} | P/L: {pct:.2f}% | Duration: {str(dur).split('.')[0]}")
             del open_trades[oid]
 
 def force_exit_before_close():
@@ -92,9 +97,9 @@ def force_exit_before_close():
         for oid in list(open_trades):
             price = client.get_latest_trade(TICKER).price
             side = OrderSide.SELL if open_trades[oid]["side"] == "buy" else OrderSide.BUY
-            client.submit_order(symbol=TICKER, qty=1, side=side,
+            client.submit_order(symbol=TICKER, qty=open_trades[oid]["qty"], side=side,
                                 type="market", time_in_force=TimeInForce.GTC)
-            send_telegram(f"Force exit {open_trades[oid]['side'].upper()} @ {price:.2f} at EOD")
+            send_telegram(f"Force exit {open_trades[oid]['side'].upper()} {open_trades[oid]['qty']}x @ {price:.2f} at EOD")
             del open_trades[oid]
 
 def check_smc():
@@ -117,7 +122,7 @@ schedule.every(1).minutes.do(check_smc)
 schedule.every(1).minutes.do(manage_exits)
 schedule.every().day.at("15:55").do(force_exit_before_close)
 
-send_telegram("Bot started with smart trailing TP logic.")
+send_telegram("Bot started with smart trailing TP logic and position sizing up to 10 shares.")
 print("Bot is running...")
 
 while True:
