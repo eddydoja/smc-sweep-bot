@@ -273,14 +273,43 @@ def check_smc():
             send_telegram(f"❌ Order error on {ticker}: {e}")
 
 # Heartbeat for Render logs (and optional Telegram)
+def print_recent_price_action(ticker):
+    try:
+        bars = client.get_bars(resolve_ticker(ticker), TimeFrame.Minute, limit=5).df
+        if bars.empty or len(bars) < 5:
+            print(f"{ticker}: Insufficient data", flush=True)
+            return
+
+        bars = bars.tail(5)
+        price_5m_ago = bars.iloc[0]['close']
+        latest_close = bars.iloc[-1]['close']
+        delta = latest_close - price_5m_ago
+        pct_change = (delta / price_5m_ago) * 100
+
+        if delta > 0:
+            arrow = "↑"
+        elif delta < 0:
+            arrow = "↓"
+        else:
+            arrow = "→"
+
+        price_fmt = f"{latest_close:.4f}" if latest_close < 10 else f"{latest_close:.2f}"
+        delta_fmt = f"{delta:+.4f}" if abs(delta) < 1 else f"{delta:+.2f}"
+        pct_fmt = f"{pct_change:+.2f}%"
+
+        print(f"{ticker}: {price_fmt} {arrow} ({delta_fmt} / {pct_fmt} over 5m)", flush=True)
+
+    except Exception as e:
+        print(f"{ticker} price fetch error: {e}", flush=True)
 
 def heartbeat():
     total = sum(len(v) for v in open_positions.values())
     msg = f"⏱️ Heartbeat {datetime.now(pytz.UTC).strftime('%H:%M:%S')} UTC | open trades: {total} | tickers active: {len(TICKERS)}"
     print(msg, flush=True)
+    for ticker in TICKERS:
+        print_recent_price_action(ticker)
     if HEARTBEAT_TELEGRAM:
         send_telegram(msg)
-
 
 def check_positions():
     for ticker, positions in open_positions.items():
@@ -316,5 +345,6 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
 
 
