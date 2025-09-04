@@ -76,4 +76,14 @@ print("Bot is running...")
 
 while True:
     schedule.run_pending()
+    send_telegram("✅ SMC Sweep Bot has started successfully.")
+print("Bot is running...")
+
+# Run immediately once for confirmation
+check_smc()
+
+while True:
+    schedule.run_pending()
+    print("Waiting for next check...")
     time.sleep(1)
+
