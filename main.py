@@ -1,101 +1,110 @@
 import os
-HEARTBEAT_TELEGRAM = False # keep heartbeats only on Render logs
+import time
+import requests
+import schedule
+import pandas as pd
+from datetime import datetime, timedelta
+import pytz
+from dotenv import load_dotenv
+from alpaca_trade_api.rest import REST, TimeFrame
 
+load_dotenv()
+
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# Toggle to execute trades vs. alert-only
+TRADE_EXECUTION = True
+HEARTBEAT_TELEGRAM = False  # keep heartbeats only on Render logs
 
 # Map unsupported indices to ETFs Alpaca supports
 TICKER_MAP = {
-"DAX": "EWG", # iShares Germany ETF
-"UKX": "EWU" # iShares UK ETF
+    "DAX": "EWG",  # iShares Germany ETF
+    "UKX": "EWU"   # iShares UK ETF
 }
 
-
 TICKERS = [
-"SPY", "QQQ", "DIA",
-"DAX", "UKX",
-"EURUSD", "GBPUSD", "USDJPY",
-"AUDUSD", "USDCAD"
+    "SPY", "QQQ", "DIA",
+    "DAX", "UKX",
+    "EURUSD", "GBPUSD", "USDJPY",
+    "AUDUSD", "USDCAD"
 ]
-
 
 client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
 open_positions = {}
 last_signal_time = {}
 
-
 SESSION_FILTER = {
-'FX': (3, 17), # London 3am–5pm UTC
-'US': (13, 20) # NY 9am–4pm EST (13–20 UTC approx)
+    'FX': (3, 17),  # London 3am–5pm UTC
+    'US': (13, 20)  # NY 9am–4pm EST (13–20 UTC approx)
 }
 
 
-
-
 def is_market_open_now():
-eastern = pytz.timezone("US/Eastern")
-now = datetime.now(eastern)
-return now.weekday() < 5 and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16))
-
+    eastern = pytz.timezone("US/Eastern")
+    now = datetime.now(eastern)
+    return now.weekday() < 5 and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16))
 
 def is_session_active(ticker):
-now_hour = datetime.now(pytz.UTC).hour
-if ticker in ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]:
-start, end = SESSION_FILTER['FX']
-else:
-start, end = SESSION_FILTER['US']
-return start <= now_hour < end
-
+    now_hour = datetime.now(pytz.UTC).hour
+    if ticker in ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]:
+        start, end = SESSION_FILTER['FX']
+    else:
+        start, end = SESSION_FILTER['US']
+    return start <= now_hour < end
 
 def resolve_ticker(ticker):
-return TICKER_MAP.get(ticker, ticker)
-
+    return TICKER_MAP.get(ticker, ticker)
 
 def send_telegram(message):
-url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-try:
-response = requests.post(url, json=payload)
-if response.ok:
-print(f"Sent Telegram message: {message}", flush=True)
-else:
-print(f"[Telegram Error] {response.status_code} - {response.text}", flush=True)
-except Exception as e:
-print(f"[Telegram Exception] {e}", flush=True)
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        response = requests.post(url, json=payload)
+        if response.ok:
+            print(f"Sent Telegram message: {message}", flush=True)
+        else:
+            print(f"[Telegram Error] {response.status_code} - {response.text}", flush=True)
+    except Exception as e:
+        print(f"[Telegram Exception] {e}", flush=True)
 
 def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
-"""Fetch bars safely; if thin data, return empty DF (no Telegram spam)."""
-try:
-resolved = resolve_ticker(ticker)
-# request larger history window when needed
-bars = client.get_bars(resolved, timeframe, limit=min(limit, 1000)).df
-if bars.empty or len(bars) < 10: # lowered requirement from 30 → 10
-return pd.DataFrame()
-# Candle features
-bars['body'] = (bars['close'] - bars['open']).abs()
-bars['range'] = bars['high'] - bars['low']
-bars['upper_wick'] = bars['high'] - bars[["open", "close"]].max(axis=1)
-bars['lower_wick'] = bars[["open", "close"]].min(axis=1) - bars['low']
-bars['is_doji'] = (bars['body'] / bars['range']).fillna(0) < 0.1
-# Patterns
-bars['bullish_engulfing'] = (bars['close'].shift(1) < bars['open'].shift(1)) & (bars['close'] > bars['open']) & (bars['close'] > bars['open'].shift(1)) & (bars['open'] < bars['close'].shift(1))
-bars['bearish_engulfing'] = (bars['close'].shift(1) > bars['open'].shift(1)) & (bars['close'] < bars['open']) & (bars['close'] < bars['open'].shift(1)) & (bars['open'] > bars['close'].shift(1))
-bars['hammer'] = (bars['body'] / bars['range'] < 0.3) & (bars['lower_wick'] > bars['body'])
-bars['inverted_hammer'] = (bars['body'] / bars['range'] < 0.3) & (bars['upper_wick'] > bars['body'])
-bars['wick_rejection_up'] = bars['upper_wick'] > (bars['range'] * 0.6)
-bars['wick_rejection_down'] = bars['lower_wick'] > (bars['range'] * 0.6)
-bars['3bar_bullish'] = (bars['close'].shift(2) < bars['open'].shift(2)) & (bars['is_doji'].shift(1)) & (bars['close'] > bars['open'])
-bars['3bar_bearish'] = (bars['close'].shift(2) > bars['open'].shift(2)) & (bars['is_doji'].shift(1)) & (bars['close'] < bars['open'])
-bars['liquidity_sweep_high'] = bars['high'] > bars['high'].rolling(window=20).max().shift(1)
-bars['liquidity_sweep_low'] = bars['low'] < bars['low'].rolling(window=20).min().shift(1)
-# Momentum candles (broader trigger)
-atr = bars['range'].rolling(14).mean()
-bars['bull_momo'] = (bars['close'] > bars['open']) & (bars['body'] > atr * 0.8) & (bars['close'] > bars['high'].shift(1))
-bars['bear_momo'] = (bars['close'] < bars['open']) & (bars['body'] > atr * 0.8) & (bars['close'] < bars['low'].shift(1))
-return bars
-except Exception as e:
-# Only print; do not Telegram every time
-print(f"⚠️ Data fetch failed for {ticker}: {e}", flush=True)
-return pd.DataFrame()
+    """Fetch bars safely; if thin data, return empty DF (no Telegram spam)."""
+    try:
+        resolved = resolve_ticker(ticker)
+        # request larger history window when needed
+        bars = client.get_bars(resolved, timeframe, limit=min(limit, 1000)).df
+        if bars.empty or len(bars) < 10:  # lowered requirement from 30 → 10
+            return pd.DataFrame()
+        # Candle features
+        bars['body'] = (bars['close'] - bars['open']).abs()
+        bars['range'] = bars['high'] - bars['low']
+        bars['upper_wick'] = bars['high'] - bars[["open", "close"]].max(axis=1)
+        bars['lower_wick'] = bars[["open", "close"]].min(axis=1) - bars['low']
+        bars['is_doji'] = (bars['body'] / bars['range']).fillna(0) < 0.1
+        # Patterns
+        bars['bullish_engulfing'] = (bars['close'].shift(1) < bars['open'].shift(1)) & (bars['close'] > bars['open']) & (bars['close'] > bars['open'].shift(1)) & (bars['open'] < bars['close'].shift(1))
+        bars['bearish_engulfing'] = (bars['close'].shift(1) > bars['open'].shift(1)) & (bars['close'] < bars['open']) & (bars['close'] < bars['open'].shift(1)) & (bars['open'] > bars['close'].shift(1))
+        bars['hammer'] = (bars['body'] / bars['range'] < 0.3) & (bars['lower_wick'] > bars['body'])
+        bars['inverted_hammer'] = (bars['body'] / bars['range'] < 0.3) & (bars['upper_wick'] > bars['body'])
+        bars['wick_rejection_up'] = bars['upper_wick'] > (bars['range'] * 0.6)
+        bars['wick_rejection_down'] = bars['lower_wick'] > (bars['range'] * 0.6)
+        bars['3bar_bullish'] = (bars['close'].shift(2) < bars['open'].shift(2)) & (bars['is_doji'].shift(1)) & (bars['close'] > bars['open'])
+        bars['3bar_bearish'] = (bars['close'].shift(2) > bars['open'].shift(2)) & (bars['is_doji'].shift(1)) & (bars['close'] < bars['open'])
+        bars['liquidity_sweep_high'] = bars['high'] > bars['high'].rolling(window=20).max().shift(1)
+        bars['liquidity_sweep_low'] = bars['low'] < bars['low'].rolling(window=20).min().shift(1)
+        # Momentum candles (broader trigger)
+        atr = bars['range'].rolling(14).mean()
+        bars['bull_momo'] = (bars['close'] > bars['open']) & (bars['body'] > atr * 0.8) & (bars['close'] > bars['high'].shift(1))
+        bars['bear_momo'] = (bars['close'] < bars['open']) & (bars['body'] > atr * 0.8) & (bars['close'] < bars['low'].shift(1))
+        return bars
+    except Exception as e:
+        # Only print; do not Telegram every time
+        print(f"⚠️ Data fetch failed for {ticker}: {e}", flush=True)
+        return pd.DataFrame()
+
 
 def detect_structure(df):
     df = df.copy()
@@ -307,4 +316,5 @@ while True:
     except Exception as loop_error:
         print(f"[Loop Error] {loop_error}", flush=True)
         time.sleep(5)
+
 
