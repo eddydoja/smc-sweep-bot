@@ -3,11 +3,10 @@ import time
 import requests
 import schedule
 import pandas as pd
-import random
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
-from alpaca_trade_api.rest import REST, TimeFrame, TimeInForce, OrderSide
+from alpaca_trade_api.rest import REST, TimeFrame
 
 load_dotenv()
 
@@ -16,113 +15,108 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TICKER = "SPY"
-MAX_TRADES = 3
-TRAIL_THRESHOLD = 0.03  # 3% initial TP trigger
-TRAIL_DROP = 0.01       # 1% drop from peak triggers exit
-STOP_LOSS_PCT = 0.02
 
 client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
-open_trades = {}
+open_positions = []
 
-def send_telegram(msg):
+def is_market_open_now():
+    eastern = pytz.timezone("US/Eastern")
+    now = datetime.now(eastern)
+    return now.weekday() < 5 and (now.hour == 9 and now.minute >= 30 or 10 <= now.hour < 16)
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-        print("[Telegram]", msg)
+        requests.post(url, json=payload)
     except Exception as e:
-        print("[Telegram Error]", e)
-
-def is_market_open():
-    tz = pytz.timezone("US/Eastern")
-    now = datetime.now(tz)
-    return now.weekday() < 5 and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16))
+        print(f"Telegram error: {e}")
 
 def get_data():
     bars = client.get_bars(TICKER, TimeFrame.Minute, limit=3).df
-    return bars if not bars.empty and 'close' in bars.columns and 'open' in bars.columns else pd.DataFrame()
+    if bars.empty or 'open' not in bars.columns or 'close' not in bars.columns:
+        return pd.DataFrame()
+    bars['body'] = abs(bars['close'] - bars['open'])
+    bars['range'] = bars['high'] - bars['low']
+    return bars
 
-def biased_tp(entry, direction):
-    if direction == "buy":
-        low, high = 1.03, 1.05
-    else:
-        low, high = 0.95, 0.97
-    r = random.random() ** 0.5
-    return round(entry * (low + (high - low) * r), 2)
+def determine_qty(rating):
+    return min(10, max(1, rating))
 
-def trade_qty():
-    # Simulated rating system for determining quantity: 1 to 10 shares
-    return random.randint(1, 10)
+def check_positions():
+    global open_positions
+    current_time = datetime.now(pytz.timezone("US/Eastern"))
+    to_close = []
+    for pos in open_positions:
+        try:
+            order = client.get_order(pos['id'])
+            if order.filled_avg_price:
+                current_price = client.get_latest_trade(TICKER).price
+                gain = (current_price - pos['entry']) / pos['entry'] * 100 if pos['side'] == 'buy' else (pos['entry'] - current_price) / pos['entry'] * 100
+                if gain <= -2 or gain >= pos['tp']:
+                    side = "sell" if pos['side'] == "buy" else "buy"
+                    client.submit_order(
+                        symbol=TICKER,
+                        qty=pos['qty'],
+                        side=side,
+                        type="market",
+                        time_in_force="gtc"
+                    )
+                    send_telegram(f"📤 Exited {pos['side'].upper()} {pos['qty']} {TICKER} at gain/loss: {gain:.2f}%")
+                    to_close.append(pos)
+        except Exception as e:
+            print(f"Error checking positions: {e}")
 
-def place_trade(direction, entry):
-    if len(open_trades) >= MAX_TRADES:
-        print("Max trades reached, skipping.")
-        return
-
-    qty = trade_qty()
-    sl = round(entry * (1 - STOP_LOSS_PCT), 2) if direction == "buy" else round(entry * (1 + STOP_LOSS_PCT), 2)
-    tp = biased_tp(entry, direction)
-
-    order = client.submit_order(
-        symbol=TICKER, qty=qty, side=OrderSide.BUY if direction == "buy" else OrderSide.SELL,
-        type="market", time_in_force=TimeInForce.GTC
-    )
-    open_trades[order.id] = {
-        "entry": entry, "side": direction, "sl": sl, "tp": tp,
-        "peak": entry, "time": datetime.now(pytz.timezone("US/Eastern")), "qty": qty
-    }
-    send_telegram(f"{direction.upper()} {qty}x @ {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
-
-def manage_exits():
-    if not open_trades: return
-    price = client.get_latest_trade(TICKER).price
-
-    for oid in list(open_trades):
-        t = open_trades[oid]
-        t["peak"] = max(t["peak"], price) if t["side"] == "buy" else min(t["peak"], price)
-        drop_amount = t["peak"] * TRAIL_DROP
-        if (t["side"] == "buy" and price <= t["peak"] - drop_amount) or (t["side"] == "sell" and price >= t["peak"] + drop_amount):
-            client.submit_order(symbol=TICKER, qty=t["qty"],
-                                side=OrderSide.SELL if t["side"] == "buy" else OrderSide.BUY,
-                                type="market", time_in_force=TimeInForce.GTC)
-            pnl = (price - t["entry"]) if t["side"] == "buy" else (t["entry"] - price)
-            pct = pnl / t["entry"] * 100
-            dur = datetime.now(pytz.timezone("US/Eastern")) - t["time"]
-            send_telegram(f"EXIT {t['side'].upper()} {t['qty']}x @ {price:.2f} | P/L: {pct:.2f}% | Duration: {str(dur).split('.')[0]}")
-            del open_trades[oid]
-
-def force_exit_before_close():
-    tz = pytz.timezone("US/Eastern")
-    now = datetime.now(tz)
-    if now.hour == 15 and now.minute >= 55 and open_trades:
-        for oid in list(open_trades):
-            price = client.get_latest_trade(TICKER).price
-            side = OrderSide.SELL if open_trades[oid]["side"] == "buy" else OrderSide.BUY
-            client.submit_order(symbol=TICKER, qty=open_trades[oid]["qty"], side=side,
-                                type="market", time_in_force=TimeInForce.GTC)
-            send_telegram(f"Force exit {open_trades[oid]['side'].upper()} {open_trades[oid]['qty']}x @ {price:.2f} at EOD")
-            del open_trades[oid]
+    open_positions = [pos for pos in open_positions if pos not in to_close]
 
 def check_smc():
-    if not is_market_open(): return
-    if len(open_trades) >= MAX_TRADES: return
+    if not is_market_open_now() or len(open_positions) >= 3:
+        return
+
     df = get_data()
-    if df.shape[0] < 3: return
+    if df.shape[0] < 3:
+        return
 
     c2, c3 = df.iloc[-2], df.iloc[-1]
-    dirn = None
-    if c2['close'] < c2['open'] and c3['close'] > c3['open'] and c3['close'] > c2['open']:
-        dirn = "buy"
-    elif c2['close'] > c2['open'] and c3['close'] < c3['open'] and c3['close'] < c2['open']:
-        dirn = "sell"
 
-    if dirn:
-        place_trade(dirn, c3['close'])
+    bullish_engulfing = c2['close'] < c2['open'] and c3['close'] > c3['open'] and c3['close'] > c2['open'] and c3['open'] < c2['close']
+    bearish_engulfing = c2['close'] > c2['open'] and c3['close'] < c3['open'] and c3['close'] < c2['open'] and c3['open'] > c2['close']
 
+    if bullish_engulfing or bearish_engulfing:
+        side = "buy" if bullish_engulfing else "sell"
+        entry_price = float(c3['close'])
+        sl = round(entry_price * 0.98, 2)
+        tp = round(entry_price * (1.04 + (0.01 * bool(entry_price % 2 == 0))), 2)  # Biased TP
+        qty = determine_qty(rating=7)  # Can adjust rating logic later
+
+        try:
+            order = client.submit_order(
+                symbol=TICKER,
+                qty=qty,
+                side=side,
+                type="market",
+                time_in_force="gtc",
+                order_class="bracket",
+                stop_loss={"stop_price": str(sl)},
+                take_profit={"limit_price": str(tp)}
+            )
+            open_positions.append({
+                'id': order.id,
+                'side': side,
+                'entry': entry_price,
+                'tp': 4,
+                'qty': qty,
+                'timestamp': datetime.now(pytz.timezone("US/Eastern"))
+            })
+            send_telegram(f"📥 Entered {side.upper()} {qty} {TICKER} @ {entry_price}\nTP: {tp} | SL: {sl}")
+        except Exception as e:
+            print(f"Order error: {e}")
+
+# Start scheduler
 schedule.every(1).minutes.do(check_smc)
-schedule.every(1).minutes.do(manage_exits)
-schedule.every().day.at("15:55").do(force_exit_before_close)
+schedule.every(2).minutes.do(check_positions)
 
-send_telegram("Bot started with smart trailing TP logic and position sizing up to 10 shares.")
+send_telegram("✅ SMC Sweep Bot has started successfully.")
 print("Bot is running...")
 
 while True:
