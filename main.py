@@ -144,18 +144,29 @@ def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
 def detect_structure(df):
     df = df.copy()
     df['is_hh'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(-1))
-    df['is_ll'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(-1))
+    df['is_ll'] = (df['low']  < df['low'].shift(1))  & (df['low']  < df['low'].shift(-1))
     swing_highs, swing_lows = df[df['is_hh']], df[df['is_ll']]
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return None
-    lh, hh = swing_highs.iloc[-2:], swing_highs.iloc[-1]
-    ll, hl = swing_lows.iloc[-2:], swing_lows.iloc[-1]
+
+    # current vs previous swings (scalars)
+    prev_sh = swing_highs.iloc[-2]
+    curr_sh = swing_highs.iloc[-1]
+    prev_sl = swing_lows.iloc[-2]
+    curr_sl = swing_lows.iloc[-1]
+
     trend = 'neutral'; bos = False
-    if hh['high'] > lh['high'] and hl['low'] > ll['low']:
+    if (curr_sh['high'] > prev_sh['high']) and (curr_sl['low'] > prev_sl['low']):
         trend, bos = 'bullish', True
-    elif hh['high'] < lh['high'] and hl['low'] < ll['low']:
+    elif (curr_sh['high'] < prev_sh['high']) and (curr_sl['low'] < prev_sl['low']):
         trend, bos = 'bearish', True
-    return {'trend': trend, 'swing_highs': swing_highs, 'swing_lows': swing_lows, 'bos': bos}
+
+    return {
+        'trend': trend,
+        'swing_highs': swing_highs,
+        'swing_lows': swing_lows,
+        'bos': bos
+    }
 
 def detect_fvg(df):
     for i in range(2, len(df)):
@@ -354,15 +365,18 @@ def print_recent_price_action(ticker):
         print(f"{ticker} price action error: {e}", flush=True)
 
 def heartbeat():
-    # --- NEW: limit render/printing to 6:00–16:00 PST ---
     if not in_pst_trading_window():
         return
-    # ----------------------------------------------------
     total = sum(len(v) for v in open_positions.values())
     msg = f"⏱️ Heartbeat {datetime.now(pytz.UTC).strftime('%H:%M:%S')} UTC | open trades: {total} | tickers active: {len(TICKERS)}"
     print(msg, flush=True)
+
+    # Only non-FX here to avoid extra FX pulls
     for t in TICKERS:
+        if t in TWELVE_FX_SYMBOLS:
+            continue
         print_recent_price_action(t)
+
     if HEARTBEAT_TELEGRAM:
         send_telegram(msg)
 
@@ -388,4 +402,5 @@ while True:
     except Exception as e:
         print(f"[Loop Error] {e}", flush=True)
         time.sleep(5)
+
 
