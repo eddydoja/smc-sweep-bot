@@ -1,4 +1,5 @@
 import os
+import itertools
 import time
 import requests
 import schedule
@@ -48,6 +49,8 @@ TWELVE_FX_SYMBOLS = {
     "AUDUSD": "AUD/USD",
     "USDCAD": "USD/CAD"
 }
+# Iterator for rotating FX pulls (reduce credits by ~80%)
+fx_cycle = itertools.cycle(TWELVE_FX_SYMBOLS.keys())
 
 # --- NEW: Pacific session guard (6:00–16:00 America/Los_Angeles) ---
 PST_TZ = pytz.timezone("America/Los_Angeles")
@@ -98,6 +101,17 @@ def get_fx_close(ticker):
     except Exception as e:
         print(f"{ticker} FX fetch error: {e}", flush=True)
         return None
+        
+def pull_fx_prices_rotating():
+    if not in_pst_trading_window():
+        return
+    ticker = next(fx_cycle)
+    res = get_fx_close(ticker)
+    if res:
+        latest_close, close_5m_ago = res
+        print(f"[FX Pull] {ticker}: {latest_close:.5f}", flush=True)
+    else:
+        print(f"{ticker}: data unavailable", flush=True)
 
 def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
     try:
@@ -357,6 +371,8 @@ schedule.every(30).seconds.do(check_smc)
 schedule.every(30).seconds.do(check_positions)
 schedule.every(30).seconds.do(scan_for_sweep_momentum_trades)
 schedule.every(60).seconds.do(heartbeat)
+schedule.every(45).seconds.do(pull_fx_prices_rotating)
+
 
 # Launch
 try:
@@ -372,3 +388,4 @@ while True:
     except Exception as e:
         print(f"[Loop Error] {e}", flush=True)
         time.sleep(5)
+
