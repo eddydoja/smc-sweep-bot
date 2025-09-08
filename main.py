@@ -21,8 +21,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# Trade behavior toggles
-TRADE_EXECUTION = True           # Equities/ETFs via Alpaca; FX is Telegram-only
+TRADE_EXECUTION = True            # Equities/ETFs via Alpaca; FX is Telegram-only
 HEARTBEAT_TELEGRAM = False
 
 # Tickers mapping for ETFs representing indexes
@@ -35,7 +34,7 @@ TICKERS = [
 client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
 
 # UTC hour filters for session gating
-SESSION_FILTER = {'FX': (3, 23), 'US': (13, 20)}  # lets FX run 6:00–4:00 PT
+SESSION_FILTER = {'FX': (3, 20), 'US': (13, 20)}  # change FX end to 23 if you want 6–16 PT
 
 twelve = TDClient(apikey=TWELVE_DATA_API_KEY)
 TWELVE_FX_SYMBOLS = {
@@ -46,7 +45,12 @@ TWELVE_FX_SYMBOLS = {
     "USDCAD": "USD/CAD"
 }
 
-# Rotate lightweight FX pulls to save credits
+# --- FX credit control (shared cache) ---
+FX_CACHE_TTL_SEC = 160   # ≈790 calls over 7h for 5 pairs (under 800)
+FX_FETCH_OUTPUTSIZE = 1800        # pull ~30 hours of 1m bars in a single call (1 credit)
+FX_CACHE = {}                     # ticker -> {'df': DataFrame, 'ts': datetime}
+
+# Rotate lightweight FX pulls (now also cache-backed)
 fx_cycle = itertools.cycle(TWELVE_FX_SYMBOLS.keys())
 
 # --- Pacific session guard (6:00–16:00 America/Los_Angeles) ---
@@ -65,7 +69,7 @@ def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        resp = requests.post(url, json=payload)
+        resp = requests.post(url, json=payload, timeout=10)
         if resp.ok:
             print(f"Sent Telegram message: {message}", flush=True)
         else:
@@ -74,43 +78,95 @@ def send_telegram(message: str):
         print(f"[Telegram Exception] {e}", flush=True)
 
 def is_market_open_now():
-    # US equities regular trading hours only
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
     return now.weekday() < 5 and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16))
 
 def is_session_active(ticker: str) -> bool:
     hour = datetime.now(pytz.UTC).hour
-    if ticker in TWELVE_FX_SYMBOLS:
-        lo, hi = SESSION_FILTER['FX']
-    else:
-        lo, hi = SESSION_FILTER['US']
+    lo, hi = SESSION_FILTER['FX'] if ticker in TWELVE_FX_SYMBOLS else SESSION_FILTER['US']
     return lo <= hour < hi
 
 def resolve_ticker(ticker: str) -> str:
     return TICKER_MAP.get(ticker, ticker)
 
-def get_fx_close(ticker: str):
-    """Quick latest vs 5m-ago close for FX (for heartbeat/position checks)."""
+# =========================
+# FX cache-backed fetchers
+# =========================
+def _now_utc():
+    return datetime.now(pytz.UTC)
+
+def _fx_required_cols_present(df: pd.DataFrame) -> bool:
+    req = {'open', 'high', 'low', 'close'}
+    return isinstance(df, pd.DataFrame) and req.issubset(set(map(str.lower, df.columns)))
+
+def _fetch_fx_df_from_api(ticker: str) -> pd.DataFrame | None:
     symbol = TWELVE_FX_SYMBOLS.get(ticker)
     if not symbol:
         return None
     try:
-        ts = twelve.time_series(symbol=symbol, interval="1min", outputsize=5).as_pandas()
-        if ts is None or ts.empty or len(ts) < 5:
+        ts = twelve.time_series(symbol=symbol, interval="1min", outputsize=FX_FETCH_OUTPUTSIZE).as_pandas()
+        if ts is None or ts.empty:
             return None
-        latest_close = float(ts['close'].iloc[0])   # newest-first
-        close_5m_ago = float(ts['close'].iloc[-1])
-        return latest_close, close_5m_ago
+        # Twelve Data often returns columns lowercase already; guard against error payloads
+        cols_lower = {c.lower(): c for c in ts.columns}
+        if not {'open', 'high', 'low', 'close'}.issubset(cols_lower.keys()):
+            # Likely an error payload due to rate limit or bad symbol
+            print(f"[FX Fetch Warning] {ticker}: missing OHLC columns; columns={list(ts.columns)}", flush=True)
+            return None
+
+        # Ensure ascending time & proper dtypes
+        df = ts.iloc[::-1].rename(columns={cols_lower['open']:'open',
+                                           cols_lower['high']:'high',
+                                           cols_lower['low']:'low',
+                                           cols_lower['close']:'close'}).copy()
+        for col in ['open','high','low','close']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(subset=['open','high','low','close'], inplace=True)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, errors='coerce')
+            df = df[~df.index.isna()]
+        df.sort_index(inplace=True)
+        return df
     except Exception as e:
-        print(f"{ticker} FX fetch error: {e}", flush=True)
+        print(f"[FX Fetch Error] {ticker}: {e}", flush=True)
         return None
+
+def _get_cached_fx_df(ticker: str) -> pd.DataFrame | None:
+    entry = FX_CACHE.get(ticker)
+    if entry:
+        age = (_now_utc() - entry['ts']).total_seconds()
+        if age < FX_CACHE_TTL_SEC and not entry['df'].empty:
+            return entry['df']
+    # refresh
+    df = _fetch_fx_df_from_api(ticker)
+    if df is not None and not df.empty:
+        FX_CACHE[ticker] = {'df': df, 'ts': _now_utc()}
+        return df
+    # if API failed but we have stale cache, serve stale to avoid crashes
+    if entry and not entry['df'].empty:
+        return entry['df']
+    return None
+
+def _fx_resample_hour(df_min: pd.DataFrame) -> pd.DataFrame:
+    # Derive 1H OHLC from 1m cache (no extra API calls)
+    res = df_min.resample('1H').agg({'open':'first','high':'max','low':'min','close':'last'})
+    return res.dropna()
+
+def get_fx_close_cached(ticker: str):
+    df = _get_cached_fx_df(ticker)
+    if df is None or df.shape[0] < 6:
+        return None
+    latest_close = float(df['close'].iloc[-1])
+    # assume 1m bars; 5m ago is 5 rows back
+    close_5m_ago = float(df['close'].iloc[-6])
+    return latest_close, close_5m_ago
 
 def pull_fx_prices_rotating():
     if not in_pst_trading_window():
         return
     ticker = next(fx_cycle)
-    res = get_fx_close(ticker)
+    res = get_fx_close_cached(ticker)
     if res:
         latest_close, _ = res
         print(f"[FX Pull] {ticker}: {latest_close:.5f}", flush=True)
@@ -118,25 +174,22 @@ def pull_fx_prices_rotating():
         print(f"{ticker}: data unavailable", flush=True)
 
 # =========================
-# Data fetch + feature engineering (shared by all strategies)
+# Data fetch + feature engineering (shared)
 # =========================
 def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
     """
-    Unified candle fetcher:
-      - Equities/ETFs → Alpaca bars
-      - FX → Twelve Data 1m series
-    Returns a DataFrame with TJR-style engineered columns ready for signal logic.
+    Equities/ETFs → Alpaca bars
+    FX → cached 1m (resampled to 1H for HTF), single API call per TTL per pair
     """
     try:
         if ticker in TWELVE_FX_SYMBOLS:
-            symbol = TWELVE_FX_SYMBOLS[ticker]
-            ts = twelve.time_series(symbol=symbol, interval="1min", outputsize=min(limit + 5, 500)).as_pandas()
-            if ts is None or ts.empty or len(ts) < 10:
+            base = _get_cached_fx_df(ticker)
+            if base is None or base.shape[0] < 10:
                 return pd.DataFrame()
-            df = ts.iloc[::-1].copy()  # ascending time
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
+            if timeframe == TimeFrame.Hour:
+                df = _fx_resample_hour(base).tail(limit).copy()
+            else:
+                df = base.tail(limit).copy()
         else:
             bars = client.get_bars(resolve_ticker(ticker), timeframe, limit=min(limit, 1000)).df
             if bars.empty or len(bars) < 10:
@@ -191,7 +244,7 @@ def get_data(ticker, timeframe=TimeFrame.Minute, limit=100):
         return pd.DataFrame()
 
 # =========================
-# TJR components (structure/FVG/OB/confidence/TP)
+# TJR components
 # =========================
 def detect_structure(df):
     df = df.copy()
@@ -242,14 +295,14 @@ def determine_qty(confidence):
 
 def calculate_confidence_tp(df, side, entry_price):
     avg_range = df['range'][-20:].mean()
-    mult = 2.2  # default R multiple
+    mult = 2.2
     precision = 5 if entry_price < 10 else 2
     return round(entry_price + avg_range * mult, precision) if side == 'long' else round(entry_price - avg_range * mult, precision)
 
-# Latest price helper (equities via Alpaca; FX via Twelve Data)
+# Latest price helper
 def latest_price(ticker):
     if ticker in TWELVE_FX_SYMBOLS:
-        res = get_fx_close(ticker)
+        res = get_fx_close_cached(ticker)
         return res[0] if res else None
     else:
         return client.get_latest_trade(resolve_ticker(ticker)).price
@@ -257,36 +310,16 @@ def latest_price(ticker):
 # =========================
 # Strategy Separation
 # =========================
-# Strategy labels
 STRAT_TJR = "TJR"
 STRAT_SCALP = "SCALP"
 
-# Namespaced state
-OPEN_POSITIONS = {
-    STRAT_TJR: {},    # dict[ticker] -> list[positions]
-    STRAT_SCALP: {},
-}
-LAST_SIGNAL_TIME = {
-    STRAT_TJR: {},
-    STRAT_SCALP: {},
-}
-LAST_SCOUT_SIGNAL_TIME = {       # TJR-only "scout" cooldowns
-    STRAT_TJR: {}
-}
+OPEN_POSITIONS = {STRAT_TJR: {}, STRAT_SCALP: {}}
+LAST_SIGNAL_TIME = {STRAT_TJR: {}, STRAT_SCALP: {}}
+LAST_SCOUT_SIGNAL_TIME = {STRAT_TJR: {}}
 
-# Optional cross-strategy symbol locks (prevents both entering same ticker simultaneously)
-SYMBOL_LOCKS = {
-    STRAT_TJR: set(),
-    STRAT_SCALP: set(),
-}
+SYMBOL_LOCKS = {STRAT_TJR: set(), STRAT_SCALP: set()}
+MAX_CONCURRENT = {STRAT_TJR: 3, STRAT_SCALP: 5}
 
-# Per-strategy risk caps
-MAX_CONCURRENT = {
-    STRAT_TJR: 3,
-    STRAT_SCALP: 5,
-}
-
-# Helper funcs for namespaced state
 def positions_count(strategy: str) -> int:
     return sum(len(v) for v in OPEN_POSITIONS[strategy].values())
 
@@ -294,9 +327,8 @@ def add_position(strategy: str, ticker: str, pos: dict):
     OPEN_POSITIONS[strategy].setdefault(ticker, []).append(pos)
 
 def can_trade_symbol(strategy: str, ticker: str) -> bool:
-    if OPEN_POSITIONS[strategy].get(ticker):  # already in that strategy
+    if OPEN_POSITIONS[strategy].get(ticker):
         return False
-    # prevent cross-strategy simultaneous entries (optional)
     if ticker in SYMBOL_LOCKS[STRAT_TJR] or ticker in SYMBOL_LOCKS[STRAT_SCALP]:
         return False
     return True
@@ -334,7 +366,7 @@ def alpaca_place_order(symbol, side, qty, sl, tp, strategy):
     return order.id
 
 # =========================
-# TJR Strategy (SMC) — signals + optional scout
+# TJR Strategy (SMC) + Scout
 # =========================
 SCOUT_TRADES_ENABLED = True
 SCOUT_TRADE_COOLDOWN_MINUTES = 10
@@ -350,7 +382,6 @@ def check_smc():
     for ticker in TICKERS:
         if not is_session_active(ticker):
             continue
-        # Equities require US RTH; FX is allowed (within PST guard + session)
         if ticker not in TWELVE_FX_SYMBOLS and not is_market_open_now():
             continue
         if not can_trade_symbol(strategy, ticker):
@@ -366,7 +397,6 @@ def check_smc():
         if not ltf or not ltf['bos'] or ltf['trend'] == 'neutral':
             continue
 
-        # Higher-timeframe alignment (hourly + ~H4 via 23 hours)
         h1 = detect_structure(get_data(ticker, TimeFrame.Hour, limit=50))
         h4 = detect_structure(get_data(ticker, TimeFrame.Hour, limit=23))
         if not (h1 and h4 and (ltf['trend'] == h1['trend'] or ltf['trend'] == h4['trend'])):
@@ -383,10 +413,10 @@ def check_smc():
         in_bear = ltf['trend'] == 'bearish' and price > fvg['start'] and price <= ob['close']
 
         cond_bull = in_bull and any(last_c[k] for k in [
-            'bullish_engulfing', 'hammer', 'is_doji', 'wick_rejection_down', '3bar_bullish', 'liquidity_sweep_low', 'bull_momo'
+            'bullish_engulfing','hammer','is_doji','wick_rejection_down','3bar_bullish','liquidity_sweep_low','bull_momo'
         ])
         cond_bear = in_bear and any(last_c[k] for k in [
-            'bearish_engulfing', 'inverted_hammer', 'is_doji', 'wick_rejection_up', '3bar_bearish', 'liquidity_sweep_high', 'bear_momo'
+            'bearish_engulfing','inverted_hammer','is_doji','wick_rejection_up','3bar_bearish','liquidity_sweep_high','bear_momo'
         ])
         side = 'long' if cond_bull else 'short' if cond_bear else None
         if not side:
@@ -402,8 +432,7 @@ def check_smc():
         try:
             if TRADE_EXECUTION and not is_fx:
                 order_id = alpaca_place_order(
-                    symbol=ticker,
-                    side=('buy' if side == 'long' else 'sell'),
+                    symbol=ticker, side=('buy' if side == 'long' else 'sell'),
                     qty=qty, sl=sl, tp=tp, strategy=strategy
                 )
             else:
@@ -425,7 +454,6 @@ def check_smc():
             send_telegram(f"❌ Order error [{strategy}] on {ticker}: {e}")
 
 def scan_for_sweep_momentum_trades():
-    """TJR 'scout' side-car (unchanged logic, now namespaced and FX-aware)."""
     strategy = STRAT_TJR
     if not in_pst_trading_window():
         return
@@ -437,7 +465,6 @@ def scan_for_sweep_momentum_trades():
     for ticker in TICKERS:
         if not is_session_active(ticker):
             continue
-        # Equities require US RTH; FX allowed
         if ticker not in TWELVE_FX_SYMBOLS and not is_market_open_now():
             continue
         if last_scout_within(strategy, ticker, timedelta(minutes=SCOUT_TRADE_COOLDOWN_MINUTES)):
@@ -477,8 +504,7 @@ def scan_for_sweep_momentum_trades():
         try:
             if TRADE_EXECUTION and not is_fx:
                 order_id = alpaca_place_order(
-                    symbol=ticker,
-                    side=('buy' if side == 'long' else 'sell'),
+                    symbol=ticker, side=('buy' if side == 'long' else 'sell'),
                     qty=qty, sl=sl, tp=tp, strategy=strategy
                 )
             else:
@@ -564,8 +590,7 @@ def check_scalper():
         try:
             if TRADE_EXECUTION and not is_fx:
                 order_id = alpaca_place_order(
-                    symbol=ticker,
-                    side=('buy' if side == 'long' else 'sell'),
+                    symbol=ticker, side=('buy' if side == 'long' else 'sell'),
                     qty=qty, sl=sl, tp=tp, strategy=strategy
                 )
             else:
@@ -606,7 +631,6 @@ def check_positions():
                         close_side = 'buy'
 
                     if gain <= -1 or gain >= pos['tp']:
-                        # Alpaca exit only for equities/ETFs
                         if TRADE_EXECUTION and ticker not in TWELVE_FX_SYMBOLS:
                             client.submit_order(symbol=ticker, qty=pos['qty'], side=close_side, type='market', time_in_force='gtc')
 
@@ -623,7 +647,7 @@ def check_positions():
 def print_recent_price_action(ticker):
     try:
         if ticker in TWELVE_FX_SYMBOLS:
-            res = get_fx_close(ticker)
+            res = get_fx_close_cached(ticker)
             if res is None:
                 print(f"{ticker}: Insufficient data", flush=True)
                 return
@@ -664,7 +688,6 @@ def heartbeat():
     )
     print(msg, flush=True)
 
-    # Show 5m movement for ALL tickers (stocks + FX)
     for t in TICKERS:
         print_recent_price_action(t)
 
@@ -697,4 +720,3 @@ while True:
     except Exception as e:
         print(f"[Loop Error] {e}", flush=True)
         time.sleep(5)
-
