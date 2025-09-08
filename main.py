@@ -35,7 +35,7 @@ TICKERS = [
 client = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url="https://paper-api.alpaca.markets")
 
 # UTC hour filters for session gating
-SESSION_FILTER = {'FX': (3, 17), 'US': (13, 20)}  # simple session windows
+SESSION_FILTER = {'FX': (3, 23), 'US': (13, 20)}  # lets FX run 6:00–4:00 PT
 
 twelve = TDClient(apikey=TWELVE_DATA_API_KEY)
 TWELVE_FX_SYMBOLS = {
@@ -697,3 +697,4 @@ while True:
     except Exception as e:
         print(f"[Loop Error] {e}", flush=True)
         time.sleep(5)
+
